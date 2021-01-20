@@ -385,7 +385,7 @@ def ensure_dataset_preprocessed(args, d_path):
 
 def make_criteo_data_and_loaders(args):
 
-    if args.mlperf_logging and args.memory_map and args.data_set == "terabyte":
+    if args.large_batch and args.memory_map and args.data_set == "terabyte":
         # more efficient for larger batches
         data_directory = path.dirname(args.raw_data_file)
 
@@ -468,6 +468,15 @@ def make_criteo_data_and_loaders(args):
                 data_filename=data_filename,
                 days=list(range(23)),
                 batch_size=args.mini_batch_size,
+                max_ind_range=args.max_ind_range,
+                split="train"
+            )
+
+            cache_loader = data_loader_terabyte.DataLoader(
+                data_directory=data_directory,
+                data_filename=data_filename,
+                days=list(range(23)),
+                batch_size=args.cache_workers*args.lookahead*args.mini_batch_size,
                 max_ind_range=args.max_ind_range,
                 split="train"
             )
