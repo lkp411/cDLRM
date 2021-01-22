@@ -202,6 +202,18 @@ def CacheEmbeddings(cached_entries_per_table, lists_of_unique_idxs, unique_indic
         eviction_fifo.put(eviction_data)
 
 
+def loss_fn_wrap(Z, T, loss_fn, args, loss_ws=None):
+    if args.loss_function == "mse" or args.loss_function == "bce":
+        return loss_fn(Z, T)
+
+    elif args.loss_function == "wbce":
+        loss_ws_ = loss_ws[T.data.view(-1).long()].view_as(T)
+        loss_fn_ = loss_fn(Z, T)
+
+    loss_sc_ = loss_ws_ * loss_fn_
+    return loss_sc_.mean()
+
+
 def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, batch_fifos, eviction_fifo, interprocess_batch_fifos, emb_tables, args, barrier):
     # First pin processes to avoid context switching overhead
     avail_cores = psutil.cpu_count() - args.trainer_start_core
@@ -213,6 +225,7 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, batch_fifos, eviction_fif
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("nccl", rank=rank, world_size=args.world_size)
+    aux_table_size = math.ceil(args.mini_batch_size / args.world_size)
 
     dlrm = DLRM_Net(
         m_spa,
@@ -222,7 +235,7 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, batch_fifos, eviction_fif
         arch_interaction_op=args.arch_interaction_op,
         arch_interaction_itself=args.arch_interaction_itself,
         max_cache_size=args.cache_size,
-        aux_table_size=math.ceil(args.mini_batch_size / args.world_size),
+        aux_table_size=aux_table_size,
         num_ways=args.num_ways,
         sync_dense_params=args.sync_dense_params,
         sigmoid_bot=-1,
@@ -233,6 +246,17 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, batch_fifos, eviction_fif
     # Create data parallel model
     ddp_model = DDP(dlrm, device_ids=[rank])
     batch_fifo = batch_fifos[rank]
+
+    if args.loss_function == "mse":
+        loss_fn = torch.nn.MSELoss(reduction="mean")
+    elif args.loss_function == "bce":
+        loss_fn = torch.nn.BCELoss(reduction="mean")
+    elif args.loss_function == "wbce":
+        loss_ws = torch.tensor(np.fromstring(args.loss_weights, dtype=float, sep="-"))
+        loss_fn = torch.nn.BCELoss(reduction="none")
+
+    # Creating optimizer
+    optimizer = torch.optim.SGD(ddp_model.parameters(), lr=args.learning_rate)
 
     # Only rank 0 loads training data
     if rank == 0:

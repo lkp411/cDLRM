@@ -218,34 +218,6 @@ class Embedding_Table_Cache_Group(nn.Module):
 
 
 class DLRM_Net(nn.Module):
-    def create_mlp(self, ln, sigmoid_layer):
-        # build MLP layer by layer
-        layers = nn.ModuleList()
-        for i in range(0, ln.size - 1):
-            n = ln[i]
-            m = ln[i + 1]
-
-            # construct fully connected operator
-            LL = nn.Linear(int(n), int(m), bias=True)
-
-            # custom Xavier input, output or two-sided fill
-            mean = 0.0  # std_dev = np.sqrt(variance)
-            std_dev = np.sqrt(2 / (m + n))  # np.sqrt(1 / m) # np.sqrt(1 / n)
-            W = np.random.normal(mean, std_dev, size=(m, n)).astype(np.float32)
-            std_dev = np.sqrt(1 / m)  # np.sqrt(2 / (m + 1))
-            bt = np.random.normal(mean, std_dev, size=m).astype(np.float32)
-            LL.weight.data = torch.tensor(W, requires_grad=True)
-            LL.bias.data = torch.tensor(bt, requires_grad=True)
-            layers.append(LL)
-
-            # construct sigmoid or relu operator
-            if i == sigmoid_layer:
-                layers.append(nn.Sigmoid())
-            else:
-                layers.append(nn.ReLU())
-
-        return torch.nn.Sequential(*layers)
-
     def __init__(
             self,
             m_spa=None,
@@ -278,6 +250,34 @@ class DLRM_Net(nn.Module):
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
             self.cache_group = Embedding_Table_Cache_Group(m_spa, ln_emb, max_cache_size, aux_table_size, num_ways)
+
+    def create_mlp(self, ln, sigmoid_layer):
+        # build MLP layer by layer
+        layers = nn.ModuleList()
+        for i in range(0, ln.size - 1):
+            n = ln[i]
+            m = ln[i + 1]
+
+            # construct fully connected operator
+            LL = nn.Linear(int(n), int(m), bias=True)
+
+            # custom Xavier input, output or two-sided fill
+            mean = 0.0  # std_dev = np.sqrt(variance)
+            std_dev = np.sqrt(2 / (m + n))  # np.sqrt(1 / m) # np.sqrt(1 / n)
+            W = np.random.normal(mean, std_dev, size=(m, n)).astype(np.float32)
+            std_dev = np.sqrt(1 / m)  # np.sqrt(2 / (m + 1))
+            bt = np.random.normal(mean, std_dev, size=m).astype(np.float32)
+            LL.weight.data = torch.tensor(W, requires_grad=True)
+            LL.bias.data = torch.tensor(bt, requires_grad=True)
+            layers.append(LL)
+
+            # construct sigmoid or relu operator
+            if i == sigmoid_layer:
+                layers.append(nn.Sigmoid())
+            else:
+                layers.append(nn.ReLU())
+
+        return torch.nn.Sequential(*layers)
 
     def interact_features(self, x, ly):
         if self.arch_interaction_op == "dot":
@@ -313,7 +313,21 @@ class DLRM_Net(nn.Module):
 
         return R
 
-    def forward(self, dense_x, lS_o, lS_i):
+    def forward(self, dense_x, lS_o, lS_i, emb_tables_cpu):
+        x = self.bot_l(dense_x)
+        ly = self.cache_group(lS_o, lS_i, emb_tables_cpu)
+        z = self.interact_features(x, ly)
+        p = self.top_l(z)
+
+        if 0.0 < self.loss_threshold < 1.0:
+            z = torch.clamp(p, min=self.loss_threshold, max=(1.0 - self.loss_threshold))
+        else:
+            z = p
+
+        return z
+
+
+    def old_forward(self, dense_x, lS_o, lS_i):
         ### prepare model (overwrite) ###
         # WARNING: # of devices must be >= batch size in parallel_forward call
         batch_size = dense_x.size()[0]
