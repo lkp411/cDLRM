@@ -10,7 +10,7 @@ import numpy as np
 import psutil
 
 import dlrm_data_pytorch as dp
-from cache_manager import CacheManagerProcess
+from cache_manager import Prefetcher
 
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -391,7 +391,7 @@ if __name__ == '__main__':
     finish_event = mp.Event()
     barrier = mp.Barrier(args.world_size)
 
-    cm = CacheManagerProcess(args, emb_tables, batch_fifos, eviction_fifo)
+    cm = Prefetcher(args, emb_tables, batch_fifos, eviction_fifo)
 
     # Pin main process
     this_pid = os.getpid()

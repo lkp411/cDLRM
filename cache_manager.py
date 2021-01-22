@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 import dlrm_data_pytorch as dp
 
 
-class CacheManagerProcess:
+class Prefetcher:
     def __init__(self, args, emb_tables_cpu, batch_fifos, eviction_fifo):
 
         # Shared variables
@@ -49,7 +49,7 @@ class CacheManagerProcess:
         print('Done pinning eviction process')
 
         try:
-            while True:
+            while (True):
                 eviction_data = eviction_fifo.get(timeout=1000)
                 for k, table_eviction_data in enumerate(eviction_data):
                     idxs = table_eviction_data[0]
@@ -60,7 +60,7 @@ class CacheManagerProcess:
             print('Eviction queue empty longer than expected. Exiting eviction manager...')
 
     def run(self):
-        eviction_process = mp.Process(target=CacheManagerProcess.eviction_manager,
+        eviction_process = mp.Process(target=Prefetcher.eviction_manager,
                                       args=(self.emb_tables_cpu, self.eviction_fifo, self.args.average_on_writeback))
         eviction_process.start()
 
@@ -72,7 +72,7 @@ class CacheManagerProcess:
         print('Created pool')
 
         print('Pinning processes')
-        results = [pool.apply_async(CacheManagerProcess.pin_pool, args=(p,)) for p in range(self.args.cache_workers)]
+        results = [pool.apply_async(Prefetcher.pin_pool, args=(p,)) for p in range(self.args.cache_workers)]
         for res in results:
             res.get()
         print('Done pinning processes. Starting cache manager.')
@@ -81,7 +81,7 @@ class CacheManagerProcess:
             for j, (X, lS_o, lS_i, T) in enumerate(cache_ld):
                 num_processes_needed = math.ceil(lS_i.shape[1] / num_examples_per_process)
 
-                processed_slices = [pool.apply_async(CacheManagerProcess.process_batch_slice, args=(
+                processed_slices = [pool.apply_async(Prefetcher.process_batch_slice, args=(
                     lS_i[:, p * num_examples_per_process:  (p + 1) * num_examples_per_process], self.emb_tables_cpu)) for p
                                     in range(num_processes_needed)]
 
