@@ -1,5 +1,6 @@
 import argparse
 import builtins
+import math
 import os
 import sys
 import time
@@ -201,7 +202,7 @@ def CacheEmbeddings(cached_entries_per_table, lists_of_unique_idxs, unique_indic
         eviction_fifo.put(eviction_data)
 
 
-def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, batch_fifos, eviction_fifo, emb_tables, args):
+def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, batch_fifos, eviction_fifo, interprocess_batch_fifos, emb_tables, args, barrier):
     # First pin processes to avoid context switching overhead
     avail_cores = psutil.cpu_count() - args.trainer_start_core
     stride = rank if rank < avail_cores else rank % avail_cores
@@ -221,7 +222,7 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, batch_fifos, eviction_fif
         arch_interaction_op=args.arch_interaction_op,
         arch_interaction_itself=args.arch_interaction_itself,
         max_cache_size=args.cache_size,
-        aux_table_size=args.mini_batch_size,
+        aux_table_size=math.ceil(args.mini_batch_size / args.world_size),
         num_ways=args.num_ways,
         sync_dense_params=args.sync_dense_params,
         sigmoid_bot=-1,
@@ -233,20 +234,35 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, batch_fifos, eviction_fif
     ddp_model = DDP(dlrm, device_ids=[rank])
     batch_fifo = batch_fifos[rank]
 
-    for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
-        time.sleep(0.015)
-        if j % args.lookahead == 0:
-            print('{} : Rank = {}, Pulling from queue...'.format(j, rank))
-            start = timer()
-            cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps = batch_fifo.get()
-            CacheEmbeddings(cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps, dlrm, eviction_fifo,
-                            rank)
-            end = timer()
-            print('Finished pulling. Average wait time = {}'.format((end - start) / args.lookahead))
+    # Only rank 0 loads training data
+    if rank == 0:
+        for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
+            if j % args.lookahead == 0:
+                print('{} : Rank = {}, Caching...'.format(j, rank))
+                start = timer()
+                cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps = batch_fifo.get()
+                CacheEmbeddings(cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps, dlrm, eviction_fifo, rank)
+                end = timer()
+                print('Rank = {}, Finished pulling. Average caching time = {}'.format(rank, (end - start) / args.lookahead))
 
-            # try syncing processes at the end of every batch
+            for ib_fifo in interprocess_batch_fifos:
+                ib_fifo.put((X, lS_o, lS_i, T))
 
+            # Proceed with training
 
+    else:
+        ib_fifo = interprocess_batch_fifos[rank - 1]
+        for j in range(len(train_ld)):
+            if j % args.lookahead == 0:
+                start = timer()
+                cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps = batch_fifo.get()
+                CacheEmbeddings(cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps, dlrm, eviction_fifo, rank)
+                end = timer()
+                print('Rank = {}. Finished pulling. Average caching time = {}'.format(rank, (end - start) / args.lookahead))
+
+            X, lS_o, lS_i, T = ib_fifo.get()
+
+            # Proceed with training
 
 
 if __name__ == '__main__':
@@ -368,42 +384,28 @@ if __name__ == '__main__':
     emb_tables = Embedding_Table_Group(m_spa, ln_emb)
     emb_tables.share_memory()
 
+    # batch_fifos = [mp.Manager().Queue(maxsize=5)] * args.world_size
     batch_fifos = [mp.Manager().Queue(maxsize=5)] * args.world_size
-    args_queue = mp.Queue()
     eviction_fifo = mp.Manager().Queue(maxsize=5)
-    args_queue.put(args)
+    interproces_batch_fifos = [mp.Manager().Queue(maxsize=1)] * (args.world_size - 1)
     finish_event = mp.Event()
+    barrier = mp.Barrier(args.world_size)
 
-    cm = CacheManagerProcess(args_queue, emb_tables, batch_fifos, eviction_fifo, finish_event)
+    cm = CacheManagerProcess(args, emb_tables, batch_fifos, eviction_fifo)
 
     # Pin main process
     this_pid = os.getpid()
     os.system("taskset -p -c %d %d" % (0, this_pid))
 
-    cm.start()
-    mp.spawn(Run,
-             args=(m_spa, ln_emb, ln_bot, ln_top, train_ld, batch_fifos, eviction_fifo, emb_tables, args),
-             nprocs=args.world_size,
-             join=True)
+    spawn_context = mp.spawn(Run,
+                             args=(m_spa, ln_emb, ln_bot, ln_top, train_ld,
+                                   batch_fifos, eviction_fifo, interproces_batch_fifos,
+                                   emb_tables, args, barrier),
+                             nprocs=args.world_size,
+                             join=False)
 
-    finish_event.set()
-    cm.join()
+    cm.run()
+    spawn_context.join()
 
-    # breakpoint()
-
-    #
-    # args_queue = mp.Queue()
-    # batch_fifo = mp.Manager().Queue(maxsize=5)
-    # eviction_fifo = mp.Manager().Queue(maxsize=5)
-    # args_queue.put(args)
-    #
-    # finish_event = mp.Event()
-    #
-    # cm = CacheManagerProcess(args_queue, emb_tables, batch_fifo, eviction_fifo, finish_event, ndevices)
-    # trainer = TrainerProcess(train_ld, test_ld, base_cache_group, dlrm, emb_tables, batch_fifo, eviction_fifo, ndevices,
-    #                          device, args)
-    #
-    # cm.start()
-    # trainer.start()
     # finish_event.set()
     # cm.join()

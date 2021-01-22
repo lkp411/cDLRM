@@ -1,28 +1,21 @@
-import numpy as np
+import math
+import os
+import gc
+
 import torch
-import threading
-from timeit import default_timer as timer
 import torch.multiprocessing as mp
 
-import copy
 import dlrm_data_pytorch as dp
-import time
-import os
-import math
 
 
-class CacheManagerProcess(mp.Process):
-    def __init__(self, args_queue, emb_tables_cpu, batch_fifos, eviction_fifo, finish_event):
-        mp.Process.__init__(self)
+class CacheManagerProcess:
+    def __init__(self, args, emb_tables_cpu, batch_fifos, eviction_fifo):
 
         # Shared variables
-        self.args_queue = args_queue
+        self.args = args
         self.emb_tables_cpu = emb_tables_cpu
         self.batch_fifos = batch_fifos
         self.eviction_fifo = eviction_fifo
-        self.finish_event = finish_event
-
-        self.emb_tables_cpu.share_memory()
 
     @staticmethod
     def pin_pool(p):
@@ -56,7 +49,7 @@ class CacheManagerProcess(mp.Process):
         print('Done pinning eviction process')
 
         try:
-            while (True):
+            while True:
                 eviction_data = eviction_fifo.get(timeout=1000)
                 for k, table_eviction_data in enumerate(eviction_data):
                     idxs = table_eviction_data[0]
@@ -66,40 +59,30 @@ class CacheManagerProcess(mp.Process):
         except:
             print('Eviction queue empty longer than expected. Exiting eviction manager...')
 
-    def create_cache_loader(self, args):
-        _, _, _, _, cache_ld = dp.make_criteo_data_and_loaders(args)
-        return cache_ld
-
     def run(self):
-        this_pid = os.getpid()
-        os.system("taskset -p -c %d %d" % (1, this_pid))
-
-        args = self.args_queue.get()
-        print(args.average_on_writeback)
-
         eviction_process = mp.Process(target=CacheManagerProcess.eviction_manager,
-                                      args=(self.emb_tables_cpu, self.eviction_fifo, args.average_on_writeback))
+                                      args=(self.emb_tables_cpu, self.eviction_fifo, self.args.average_on_writeback))
         eviction_process.start()
 
-        num_examples_per_process = args.lookahead * args.mini_batch_size
+        num_examples_per_process = self.args.lookahead * self.args.mini_batch_size
 
-        cache_ld = self.create_cache_loader(args)
-        pool = mp.Pool(processes=args.cache_workers)
+        _, _, _, _, cache_ld = dp.make_criteo_data_and_loaders(self.args)
 
+        pool = mp.Pool(processes=self.args.cache_workers)
         print('Created pool')
 
         print('Pinning processes')
-        results = [pool.apply_async(CacheManagerProcess.pin_pool, args=(p,)) for p in range(args.cache_workers)]
+        results = [pool.apply_async(CacheManagerProcess.pin_pool, args=(p,)) for p in range(self.args.cache_workers)]
         for res in results:
             res.get()
-
         print('Done pinning processes. Starting cache manager.')
-        for epoch in range(args.nepochs):
+
+        for epoch in range(self.args.nepochs):
             for j, (X, lS_o, lS_i, T) in enumerate(cache_ld):
                 num_processes_needed = math.ceil(lS_i.shape[1] / num_examples_per_process)
 
                 processed_slices = [pool.apply_async(CacheManagerProcess.process_batch_slice, args=(
-                lS_i[:, p * num_examples_per_process:  (p + 1) * num_examples_per_process], self.emb_tables_cpu)) for p
+                    lS_i[:, p * num_examples_per_process:  (p + 1) * num_examples_per_process], self.emb_tables_cpu)) for p
                                     in range(num_processes_needed)]
 
                 for res in processed_slices:
@@ -111,4 +94,3 @@ class CacheManagerProcess(mp.Process):
         pool.close()
         pool.join()
         eviction_process.join()
-        self.finish_event.wait()
