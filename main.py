@@ -16,6 +16,7 @@ with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import torch
+import torch.nn as nn
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -124,6 +125,7 @@ def ProcessArgs():
     ################################## Distributed training ################################
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--trainer-start-core", type=int, default=7)
+    parser.add_argument("--dense-threshold", type=int, default=1000)
     ########################################################################################
 
     ######################################## Misc ##########################################
@@ -202,6 +204,13 @@ def CacheEmbeddings(cached_entries_per_table, lists_of_unique_idxs, unique_indic
         eviction_fifo.put(eviction_data)
 
 
+def process_lookahead_window(dlrm, batch_fifo, eviction_fifo, rank):
+    aggregate_large_tables_multigpu(dlrm)
+    torch.cuda.synchronize(rank)
+    cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps = batch_fifo.get()
+    CacheEmbeddings(cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps, dlrm, eviction_fifo, rank)
+
+
 def loss_fn_wrap(Z, T, loss_fn, args, loss_ws=None):
     if args.loss_function == "mse" or args.loss_function == "bce":
         return loss_fn(Z, T)
@@ -214,7 +223,78 @@ def loss_fn_wrap(Z, T, loss_fn, args, loss_ws=None):
     return loss_sc_.mean()
 
 
-def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, batch_fifos, eviction_fifo, interprocess_batch_fifos, emb_tables, args, barrier):
+def aggregate_large_tables_multigpu(model):
+    with torch.no_grad():
+        for i, table in enumerate(model.cache_group.emb_l):
+            if not model.cache_group.undersized_map[i]:
+                table.weight /= dist.get_world_size()
+                dist.all_reduce_multigpu([table.weight], async_op=True)
+
+
+def aggregate_gradients(model, req_obj_send, req_objs_recv, recieve_tensors):
+    # Aggregate MLPs
+    for layer in model.bot_l:
+        if isinstance(layer, nn.modules.linear.Linear):
+            layer.weight.grad /= dist.get_world_size()
+            dist.all_reduce_multigpu([layer.weight.grad], async_op=True)
+
+    for layer in model.top_l:
+        if isinstance(layer, nn.modules.linear.Linear):
+            layer.weight.grad /= dist.get_world_size()
+            dist.all_reduce_multigpu([layer.weight.grad], async_op=True)
+
+    # Wait for broadcasts to finish
+    while not req_obj_send.is_completed():
+        continue
+
+    for req_obj in req_objs_recv:
+        while not req_obj.is_completed():
+            continue
+
+    cache_lookups = torch.cat(recieve_tensors, dim=1)
+
+    # Aggregate Small tables
+    for i, table in enumerate(model.cache_group.emb_l):
+        if model.cache_group.undersized_map[i]:
+            unique_idxs = torch.unique(cache_lookups[i], sorted=True)
+            grad_silce = table.weight.grad[unique_idxs] / dist.get_world_size()
+            dist.all_reduce_multigpu([grad_silce], async_op=False)
+            table.weight.grad[unique_idxs] = grad_silce
+
+
+def train_iteration(j, local_batch_size, X, lS_i, lS_o, T, ddp_model, emb_tables, loss_fn, loss_ws, optimizer, args, rank):
+    # Get slice for this process
+    X = X[rank * local_batch_size: (rank + 1) * local_batch_size, :]
+    lS_i = lS_i[:, rank * local_batch_size: (rank + 1) * local_batch_size]
+    lS_o = lS_o[:, :local_batch_size]
+    T = T[rank * local_batch_size: (rank + 1) * local_batch_size, :].to(rank)
+
+    # Run forward + backward + param update
+    Z, cache_group_idxs = ddp_model(X, lS_o, lS_i, emb_tables, rank)
+
+    # Broadcast cache_group idxs before starting forward and backward
+    req_obj_send = dist.broadcast(cache_group_idxs, src=rank, async_op=True)
+
+    # Make broadcast calls to recieve
+    recieve_tensors = [torch.zeros_like(cache_group_idxs)] * dist.get_world_size()
+    recieve_tensors[rank] = cache_group_idxs
+
+    req_objs_recv = []
+    for i in range(dist.get_world_size()):
+        if i != rank:
+            req_objs_recv.append(dist.broadcast(recieve_tensors[i], src=i, async_op=True))
+
+    L = loss_fn_wrap(Z, T, loss_fn, args, loss_ws)
+    L.backward()
+    aggregate_gradients(ddp_model.module, req_obj_send, req_objs_recv, recieve_tensors)
+    torch.cuda.synchronize(rank)
+    optimizer.step()
+    optimizer.zero_grad()
+
+    return L, Z, T
+
+
+def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, eviction_fifo, interprocess_batch_fifos, emb_tables, args):
     # First pin processes to avoid context switching overhead
     avail_cores = psutil.cpu_count() - args.trainer_start_core
     stride = rank if rank < avail_cores else rank % avail_cores
@@ -225,7 +305,7 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, batch_fifos, eviction_fif
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("nccl", rank=rank, world_size=args.world_size)
-    aux_table_size = math.ceil(args.mini_batch_size / args.world_size)
+    local_batch_size = math.ceil(args.mini_batch_size / args.world_size)
 
     dlrm = DLRM_Net(
         m_spa,
@@ -235,7 +315,8 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, batch_fifos, eviction_fif
         arch_interaction_op=args.arch_interaction_op,
         arch_interaction_itself=args.arch_interaction_itself,
         max_cache_size=args.cache_size,
-        aux_table_size=aux_table_size,
+        aux_table_size=local_batch_size,
+        dense_threshold=args.dense_threshold,
         num_ways=args.num_ways,
         sync_dense_params=args.sync_dense_params,
         sigmoid_bot=-1,
@@ -249,8 +330,10 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, batch_fifos, eviction_fif
 
     if args.loss_function == "mse":
         loss_fn = torch.nn.MSELoss(reduction="mean")
+        loss_ws = None
     elif args.loss_function == "bce":
         loss_fn = torch.nn.BCELoss(reduction="mean")
+        loss_ws = None
     elif args.loss_function == "wbce":
         loss_ws = torch.tensor(np.fromstring(args.loss_weights, dtype=float, sep="-"))
         loss_fn = torch.nn.BCELoss(reduction="none")
@@ -258,35 +341,148 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, batch_fifos, eviction_fif
     # Creating optimizer
     optimizer = torch.optim.SGD(ddp_model.parameters(), lr=args.learning_rate)
 
-    # Only rank 0 loads training data
-    if rank == 0:
-        for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
-            if j % args.lookahead == 0:
-                print('{} : Rank = {}, Caching...'.format(j, rank))
+    caching_overhead = 0
+    num_cache_steps = 0
+    forward_time = 0
+    total_iter = 0
+    total_loss = 0
+    total_accu = 0
+    total_samp = 0
+    total_loss_world = 0
+    total_acc_world = 0
+
+    # Don't sync any params
+    with ddp_model.no_sync():
+        # Only rank 0 loads training data
+        if rank == 0:
+            for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
+                if j % args.lookahead == 0:
+                    start = timer()
+                    process_lookahead_window(dlrm, batch_fifo, eviction_fifo, rank)
+                    end = timer()
+                    caching_overhead += (end - start)
+                    num_cache_steps += 1
+
+                for ib_fifo in interprocess_batch_fifos:
+                    ib_fifo.put((X, lS_o, lS_i, T))
+
                 start = timer()
-                cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps = batch_fifo.get()
-                CacheEmbeddings(cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps, dlrm, eviction_fifo, rank)
+                L, Z, T = train_iteration(j, local_batch_size, X, lS_i, lS_o, T, ddp_model, emb_tables, loss_fn, loss_ws, optimizer,
+                                          args, rank)
                 end = timer()
-                print('Rank = {}, Finished pulling. Average caching time = {}'.format(rank, (end - start) / args.lookahead))
 
-            for ib_fifo in interprocess_batch_fifos:
-                ib_fifo.put((X, lS_o, lS_i, T))
+                L = L.detach().cpu().numpy()
+                S = Z.detach().cpu().numpy()
+                T = T.detach().cpu().numpy()
+                mbs = T.shape[0]
+                A = np.sum((np.round(S, 0) == T).astype(np.uint32))
 
-            # Proceed with training
+                # Get losses and accuracies from other processes
+                for process in range(1, dist.get_world_size()):
+                    # Get losses
+                    L_t = torch.tensor(L, device=rank)
+                    L_p = torch.zeros_like(L_t)
+                    dist.broadcast(L_p, src=process)
+                    L_p = L_p.detach().cpu().numpy()
+                    total_loss_world += L_p * mbs
 
-    else:
-        ib_fifo = interprocess_batch_fifos[rank - 1]
-        for j in range(len(train_ld)):
-            if j % args.lookahead == 0:
+                    # Get accuracies
+                    A_t = torch.tensor([A.item()], device=rank)
+                    A_p = torch.zeros_like(A_t)
+                    dist.broadcast(A_p, src=process)
+                    A_p = A_p.detach().cpu().item()
+                    total_acc_world += A_p
+
+                forward_time += (end - start)
+                total_loss += ((L * mbs + total_loss_world) / dist.get_world_size())
+                total_accu += ((A + total_acc_world) / dist.get_world_size())
+                total_samp += mbs
+                total_iter += 1
+                total_loss_world = 0
+                total_acc_world = 0
+
+                if j > 0 and j % args.print_freq == 0:
+                    avg_caching_overhead = caching_overhead / (num_cache_steps * args.lookahead)
+                    avg_forward_time = forward_time / total_iter
+                    avg_loss = total_loss / total_samp
+                    avg_acc = total_accu / total_samp
+
+                    # Test
+                    test_samp = 0
+                    total_test_acc = 0
+                    with torch.no_grad():
+                        for i, (X, lS_o, lS_i, T) in enumerate(test_ld):
+                            X = X.to(rank)
+                            Z, _ = dlrm(X, lS_o, lS_i, emb_tables, rank)
+                            S = Z.cpu().numpy()
+                            T = T.cpu().numpy()
+                            test_acc = np.sum((np.round(S, 0) == T).astype(np.uint32))
+                            test_samp += T.shape[0]
+                            total_test_acc += test_acc
+
+                    print(
+                        f'Iter = {j}: '
+                        f'Rank = {rank}, '
+                        f'Avg overhead = {1000 * avg_caching_overhead}, '
+                        f'Avg iter Time = {1000 * avg_forward_time}, '
+                        f'Loss = {avg_loss}, Train Acc = {100 * avg_acc}, '
+                        f'Test acc = {100 * (total_test_acc / test_samp)}'
+                    )
+
+                    forward_time = 0
+                    caching_overhead = 0
+                    num_cache_steps = 0
+                    total_loss = 0
+                    total_accu = 0
+                    total_iter = 0
+                    total_samp = 0
+
+        else:
+            ib_fifo = interprocess_batch_fifos[rank - 1]
+
+            for j in range(len(train_ld)):
+                if j % args.lookahead == 0:
+                    start = timer()
+                    process_lookahead_window(dlrm, batch_fifo, eviction_fifo, rank)
+                    end = timer()
+                    caching_overhead += (end - start)
+                    num_cache_steps += 1
+
+                X, lS_o, lS_i, T = ib_fifo.get()
+
                 start = timer()
-                cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps = batch_fifo.get()
-                CacheEmbeddings(cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps, dlrm, eviction_fifo, rank)
+                L, Z, T = train_iteration(j, local_batch_size, X, lS_i, lS_o, T, ddp_model, emb_tables, loss_fn, loss_ws, optimizer,
+                                          args, rank)
                 end = timer()
-                print('Rank = {}. Finished pulling. Average caching time = {}'.format(rank, (end - start) / args.lookahead))
 
-            X, lS_o, lS_i, T = ib_fifo.get()
+                L = L.detach().cpu().numpy()
+                S = Z.detach().cpu().numpy()
+                T = T.detach().cpu().numpy()
+                mbs = T.shape[0]
+                A = np.sum((np.round(S, 0) == T).astype(np.uint32))
 
-            # Proceed with training
+                L_t = torch.tensor(L, device=rank)
+                A_t = torch.tensor([A.item()], device=rank)
+                dist.broadcast(L_t, src=rank)
+                dist.broadcast(A_t, src=rank)
+
+                forward_time += (end - start)
+                total_iter += 1
+
+                if j > 0 and j % args.print_freq == 0:
+                    avg_caching_overhead = caching_overhead / (num_cache_steps * args.lookahead)
+                    avg_forward_time = forward_time / total_iter
+
+                    print('Iteration = {}: Rank = {}, Avg Caching Overhead = {}, Avg Iteration Time = {}'.format(j,
+                                                                                                                 rank,
+                                                                                                                 1000 * avg_caching_overhead,
+                                                                                                                 1000 * avg_forward_time,
+                                                                                                                 ))
+
+                    forward_time = 0
+                    caching_overhead = 0
+                    num_cache_steps = 0
+                    total_iter = 0
 
 
 if __name__ == '__main__':
@@ -415,21 +611,19 @@ if __name__ == '__main__':
     finish_event = mp.Event()
     barrier = mp.Barrier(args.world_size)
 
-    cm = Prefetcher(args, emb_tables, batch_fifos, eviction_fifo)
+    cm = Prefetcher(args, emb_tables, batch_fifos, eviction_fifo, finish_event, cache_ld)
 
     # Pin main process
     this_pid = os.getpid()
     os.system("taskset -p -c %d %d" % (0, this_pid))
 
+    cm.start()
     spawn_context = mp.spawn(Run,
-                             args=(m_spa, ln_emb, ln_bot, ln_top, train_ld,
+                             args=(m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld,
                                    batch_fifos, eviction_fifo, interproces_batch_fifos,
-                                   emb_tables, args, barrier),
+                                   emb_tables, args),
                              nprocs=args.world_size,
-                             join=False)
+                             join=True)
 
-    cm.run()
-    spawn_context.join()
-
-    # finish_event.set()
-    # cm.join()
+    finish_event.set()
+    cm.join()

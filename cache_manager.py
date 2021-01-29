@@ -8,14 +8,17 @@ import torch.multiprocessing as mp
 import dlrm_data_pytorch as dp
 
 
-class Prefetcher:
-    def __init__(self, args, emb_tables_cpu, batch_fifos, eviction_fifo):
+class Prefetcher(mp.Process):
+    def __init__(self, args, emb_tables_cpu, batch_fifos, eviction_fifo, finish_event, cache_ld):
+        mp.Process.__init__(self)
 
         # Shared variables
         self.args = args
         self.emb_tables_cpu = emb_tables_cpu
         self.batch_fifos = batch_fifos
         self.eviction_fifo = eviction_fifo
+        self.finish_event = finish_event
+        self.cache_ld = cache_ld
 
     @staticmethod
     def pin_pool(p):
@@ -66,7 +69,7 @@ class Prefetcher:
 
         num_examples_per_process = self.args.lookahead * self.args.mini_batch_size
 
-        _, _, _, _, cache_ld = dp.make_criteo_data_and_loaders(self.args)
+        #_, _, _, _, cache_ld = dp.make_criteo_data_and_loaders(self.args)
 
         pool = mp.Pool(processes=self.args.cache_workers)
         print('Created pool')
@@ -78,7 +81,7 @@ class Prefetcher:
         print('Done pinning processes. Starting cache manager.')
 
         for epoch in range(self.args.nepochs):
-            for j, (X, lS_o, lS_i, T) in enumerate(cache_ld):
+            for j, (X, lS_o, lS_i, T) in enumerate(self.cache_ld):
                 num_processes_needed = math.ceil(lS_i.shape[1] / num_examples_per_process)
 
                 processed_slices = [pool.apply_async(Prefetcher.process_batch_slice, args=(
@@ -94,3 +97,4 @@ class Prefetcher:
         pool.close()
         pool.join()
         eviction_process.join()
+        self.finish_event.wait()

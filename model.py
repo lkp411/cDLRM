@@ -104,16 +104,17 @@ class Embedding_Table_Cache_Group(nn.Module):
                  ln_emb,
                  max_cache_size,
                  aux_table_size,
+                 dense_threshold,
                  num_ways):
 
         super(Embedding_Table_Cache_Group, self).__init__()
         self.ln_emb = ln_emb
         self.num_ways = num_ways
 
+        self.dense_threshold = dense_threshold
         self.max_cache_size = self.find_next_prime(max_cache_size)
 
-        self.emb_l, self.cache_sizes = self.create_emb(m_spa, ln_emb, self.max_cache_size, num_ways,
-                                                       aux_table_size)  # emb_l[i] is a set of num_ways tables, each corresponding to 1 way. The set would just be the row itself.
+        self.emb_l, self.cache_sizes, self.undersized_map = self.create_emb(m_spa, ln_emb, self.max_cache_size, num_ways, aux_table_size)  # emb_l[i] is a set of num_ways tables, each corresponding to 1 way. The set would just be the row itself.
 
         self.occupancy_tables = self.create_occupancy_tables(self.cache_sizes, num_ways)
 
@@ -130,24 +131,27 @@ class Embedding_Table_Cache_Group(nn.Module):
     def create_emb(self, m, ln, max_cache_size, num_ways, aux_table_size):
         emb_l = nn.ModuleList()
         cache_sizes = []
+        undersized_map = {}
 
         for i in range(0, ln.size):
             n = ln[i]
             num_rows = n if n < max_cache_size else max_cache_size
+            sparsity = n.item() > self.dense_threshold
             cache_sizes.append(num_rows)
-
-            EE = nn.EmbeddingBag(num_ways * num_rows + aux_table_size, m, mode="sum", sparse=True)
+            EE = nn.EmbeddingBag(num_ways * num_rows + aux_table_size, m, mode="sum", sparse=sparsity)
 
             emb_l.append(EE)
 
-        return emb_l, cache_sizes
+            undersized_map[i] = n < self.dense_threshold
+
+        return emb_l, cache_sizes, undersized_map
 
     def create_occupancy_tables(self, cache_sizes, num_ways):
         occupancy_tables = [-1 * torch.ones(cache_sizes[i], num_ways, dtype=torch.int64) for i in
                             range(len(cache_sizes))]
         return occupancy_tables
 
-    def forward(self, lS_o, lS_i, emb_tables):
+    def forward(self, lS_o, lS_i, emb_tables, rank):
         # WARNING: notice that we are processing the batch at once. We implicitly
         # assume that the data is laid out such that:
         # 1. each embedding is indexed with a group of sparse indices,
@@ -160,41 +164,34 @@ class Embedding_Table_Cache_Group(nn.Module):
 
         ly = []
         per_table_hit_rates = []
+        cache_group_idxs = []
         for k, sparse_index_group_batch in enumerate(lS_i):
-            device = torch.device("cuda:" + str(k % self.ndevices))
-
             occupancy_table = self.occupancy_tables[k]
 
-            set_idxs = self.compute_set_indices(k,
-                                                sparse_index_group_batch)  # of shape torch.Size([2048]). set_idx[i] is the set_idx that sparse_index_group_batch[i] maps to.
+            set_idxs = self.compute_set_indices(k, sparse_index_group_batch)  # of shape torch.Size([2048]). set_idx[i] is the set_idx that sparse_index_group_batch[i] maps to.
             hit_tensor = (occupancy_table[set_idxs] == sparse_index_group_batch.view(-1, 1)).any(dim=1)
             hit_positions = hit_tensor.nonzero(as_tuple=False).flatten()
             miss_positions = (hit_tensor == False).nonzero(as_tuple=False).flatten()
 
             hitting_set_idxs = set_idxs[hit_positions]
-            hitting_ways = \
-                (occupancy_table[hitting_set_idxs] == sparse_index_group_batch[hit_positions].view(-1, 1)).nonzero(
-                    as_tuple=True)[1]
+            hitting_ways = (occupancy_table[hitting_set_idxs] == sparse_index_group_batch[hit_positions].view(-1, 1)).nonzero(as_tuple=True)[1]
             hitting_cache_lookup_idxs = self.cache_sizes[k] * hitting_ways + hitting_set_idxs
 
             missing_sparse_idxs = sparse_index_group_batch[miss_positions]  # Need to fetch from embedding table
-            aux_storage_idxs = torch.tensor(
-                [self.cache_sizes[k] * self.num_ways + i for i in range(missing_sparse_idxs.shape[0])],
-                dtype=torch.long, device=device)
-            self.emb_l[k].weight.data[aux_storage_idxs] = emb_tables.emb_l[k].weight.data[missing_sparse_idxs].to(
-                device)
+            aux_storage_idxs = torch.tensor([self.cache_sizes[k] * self.num_ways + i for i in range(missing_sparse_idxs.shape[0])], dtype=torch.long, device=rank)
+            self.emb_l[k].weight.data[aux_storage_idxs] = emb_tables.emb_l[k].weight.data[missing_sparse_idxs].to(rank)
 
             cache_lookup_idxs = torch.empty(sparse_index_group_batch.shape, dtype=torch.long)
             cache_lookup_idxs[hit_positions] = hitting_cache_lookup_idxs
 
-            cache_lookup_idxs = cache_lookup_idxs.to(device)
+            cache_lookup_idxs = cache_lookup_idxs.to(rank)
             cache_lookup_idxs[miss_positions] = aux_storage_idxs
 
             self.victim_cache_entries[k] = (aux_storage_idxs, missing_sparse_idxs)
 
             # print(k, hit_positions.shape)
 
-            sparse_offset_group_batch = lS_o[k].to(device)
+            sparse_offset_group_batch = lS_o[k].to(rank)
 
             # embedding lookup
             # We are using EmbeddingBag, which implicitly uses sum operator.
@@ -207,6 +204,7 @@ class Embedding_Table_Cache_Group(nn.Module):
 
             V = E(cache_lookup_idxs, sparse_offset_group_batch)  # 2048 x 64 tensor
             ly.append(V)
+            cache_group_idxs.append(cache_lookup_idxs)
 
         # hit_rate = hit_positions.shape[0] / sparse_index_group_batch.shape[0]
         # per_table_hit_rates.append(hit_rate)
@@ -214,7 +212,7 @@ class Embedding_Table_Cache_Group(nn.Module):
         if len(self.emb_l) != len(ly):
             sys.exit("ERROR: corrupted intermediate result in parallel_forward call")
 
-        return ly  # , sum(per_table_hit_rates) / lS_i.shape[0]
+        return ly, cache_group_idxs  # , sum(per_table_hit_rates) / lS_i.shape[0]
 
 
 class DLRM_Net(nn.Module):
@@ -228,6 +226,7 @@ class DLRM_Net(nn.Module):
             arch_interaction_itself=False,
             max_cache_size=None,
             aux_table_size=None,
+            dense_threshold=None,
             num_ways=None,
             sync_dense_params=True,
             sigmoid_bot=-1,
@@ -245,11 +244,12 @@ class DLRM_Net(nn.Module):
             self.arch_interaction_itself = arch_interaction_itself
             self.sync_dense_params = sync_dense_params
             self.loss_threshold = loss_threshold
+            self.cpu = torch.device('cpu')
 
             # Trainable parameters
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
-            self.cache_group = Embedding_Table_Cache_Group(m_spa, ln_emb, max_cache_size, aux_table_size, num_ways)
+            self.cache_group = Embedding_Table_Cache_Group(m_spa, ln_emb, max_cache_size, aux_table_size, dense_threshold, num_ways)
 
     def create_mlp(self, ln, sigmoid_layer):
         # build MLP layer by layer
@@ -296,8 +296,8 @@ class DLRM_Net(nn.Module):
             # li, lj = torch.tril_indices(ni, nj, offset=offset)
             # approach 2: custom
             offset = 1 if self.arch_interaction_itself else 0
-            li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
-            lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
+            li = torch.tensor([i for i in range(ni) for j in range(i + offset)], dtype=torch.long)
+            lj = torch.tensor([j for i in range(nj) for j in range(i + offset)], dtype=torch.long)
             Zflat = Z[:, li, lj]
             # concatenate dense features and interactions
             R = torch.cat([x] + [Zflat], dim=1)
@@ -313,9 +313,9 @@ class DLRM_Net(nn.Module):
 
         return R
 
-    def forward(self, dense_x, lS_o, lS_i, emb_tables_cpu):
+    def forward(self, dense_x, lS_o, lS_i, emb_tables_cpu, rank):
         x = self.bot_l(dense_x)
-        ly = self.cache_group(lS_o, lS_i, emb_tables_cpu)
+        ly, cache_group_idxs = self.cache_group(lS_o.to(self.cpu), lS_i.to(self.cpu), emb_tables_cpu, rank)
         z = self.interact_features(x, ly)
         p = self.top_l(z)
 
@@ -324,67 +324,7 @@ class DLRM_Net(nn.Module):
         else:
             z = p
 
-        return z
-
-
-    def old_forward(self, dense_x, lS_o, lS_i):
-        ### prepare model (overwrite) ###
-        # WARNING: # of devices must be >= batch size in parallel_forward call
-        batch_size = dense_x.size()[0]
-        ndevices = min(self.ndevices, batch_size)
-        device_ids = range(ndevices)
-        # WARNING: must redistribute the model if mini-batch size changes(this is common
-        # for last mini-batch, when # of elements in the dataset/batch size is not even
-        if self.parallel_model_batch_size != batch_size:
-            self.parallel_model_is_not_prepared = True
-
-        if self.parallel_model_is_not_prepared or self.sync_dense_params:
-            # replicate mlp (data parallelism)
-            self.bot_l_replicas = replicate(self.bot_l, device_ids)
-            self.top_l_replicas = replicate(self.top_l, device_ids)
-            self.parallel_model_batch_size = batch_size
-
-        ### prepare input (overwrite) ###
-        # scatter dense features (data parallelism)
-
-        dense_x = scatter(dense_x, device_ids, dim=0)
-        x = parallel_apply(self.bot_l_replicas, dense_x, None, device_ids)
-
-        t_list = []
-        for k, _ in enumerate(ly):  # Changed from enumerate(self.emb_l) to enumerate(ly)
-            d = torch.device("cuda:" + str(k % self.ndevices))
-            y = scatter(ly[k], device_ids, dim=0)
-            t_list.append(y)
-        # adjust the list to be ordered per device
-        ly = list(map(lambda y: list(y), zip(*t_list)))
-
-        # interactions
-        z = []
-        for k in range(ndevices):
-            zk = self.interact_features(x[k], ly[k])
-            z.append(zk)
-
-        # top mlp
-        # WARNING: Note that the self.top_l is a list of top mlp modules that
-        # have been replicated across devices, while z is a list of interaction results
-        # that by construction are scattered across devices on the first (batch) dim.
-        # The output is a list of tensors scattered across devices according to the
-        # distribution of z.
-        p = parallel_apply(self.top_l_replicas, z, None, device_ids)
-
-        ### gather the distributed results ###
-        p0 = gather(p, self.output_d, dim=0)
-
-        # clamp output if needed
-        if 0.0 < self.loss_threshold and self.loss_threshold < 1.0:
-            z0 = torch.clamp(
-                p0, min=self.loss_threshold, max=(1.0 - self.loss_threshold)
-            )
-        else:
-            z0 = p0
-
-        return z0
-
+        return z, torch.stack(cache_group_idxs)
 
 def isPrime(n):
     if n == 1 or n == 2:
