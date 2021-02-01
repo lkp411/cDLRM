@@ -138,7 +138,7 @@ class Embedding_Table_Cache_Group(nn.Module):
             num_rows = n if n < max_cache_size else max_cache_size
             sparsity = n.item() > self.dense_threshold
             cache_sizes.append(num_rows)
-            EE = nn.EmbeddingBag(num_ways * num_rows + aux_table_size, m, mode="sum", sparse=sparsity)
+            EE = nn.EmbeddingBag(num_ways * num_rows + aux_table_size, m, mode="sum", sparse=False)
 
             emb_l.append(EE)
 

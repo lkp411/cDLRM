@@ -205,8 +205,8 @@ def CacheEmbeddings(cached_entries_per_table, lists_of_unique_idxs, unique_indic
 
 
 def process_lookahead_window(dlrm, batch_fifo, eviction_fifo, rank):
-    aggregate_large_tables_multigpu(dlrm)
-    torch.cuda.synchronize(rank)
+    # aggregate_large_tables_multigpu(dlrm)
+    # torch.cuda.synchronize(rank)
     cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps = batch_fifo.get()
     CacheEmbeddings(cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps, dlrm, eviction_fifo, rank)
 
@@ -231,7 +231,7 @@ def aggregate_large_tables_multigpu(model):
                 dist.all_reduce_multigpu([table.weight], async_op=True)
 
 
-def aggregate_gradients(model, req_obj_send, req_objs_recv, recieve_tensors):
+def aggregate_gradients(model, dist_request_objs, recieve_tensors, rank, barrier):
     # Aggregate MLPs
     for layer in model.bot_l:
         if isinstance(layer, nn.modules.linear.Linear):
@@ -244,10 +244,7 @@ def aggregate_gradients(model, req_obj_send, req_objs_recv, recieve_tensors):
             dist.all_reduce_multigpu([layer.weight.grad], async_op=True)
 
     # Wait for broadcasts to finish
-    while not req_obj_send.is_completed():
-        continue
-
-    for req_obj in req_objs_recv:
+    for req_obj in dist_request_objs:
         while not req_obj.is_completed():
             continue
 
@@ -255,14 +252,13 @@ def aggregate_gradients(model, req_obj_send, req_objs_recv, recieve_tensors):
 
     # Aggregate Small tables
     for i, table in enumerate(model.cache_group.emb_l):
-        if model.cache_group.undersized_map[i]:
-            unique_idxs = torch.unique(cache_lookups[i], sorted=True)
-            grad_silce = table.weight.grad[unique_idxs] / dist.get_world_size()
-            dist.all_reduce_multigpu([grad_silce], async_op=False)
-            table.weight.grad[unique_idxs] = grad_silce
+        # if model.cache_group.undersized_map[i]:
+        unique_idxs = torch.unique(cache_lookups[i], sorted=True)
+        grad_slice = table.weight.grad[unique_idxs] / dist.get_world_size()
+        dist.all_reduce(grad_slice, async_op=False)
 
 
-def train_iteration(j, local_batch_size, X, lS_i, lS_o, T, ddp_model, emb_tables, loss_fn, loss_ws, optimizer, args, rank):
+def train_iteration(j, local_batch_size, X, lS_i, lS_o, T, ddp_model, emb_tables, loss_fn, loss_ws, optimizer, args, rank, barrier):
     # Get slice for this process
     X = X[rank * local_batch_size: (rank + 1) * local_batch_size, :]
     lS_i = lS_i[:, rank * local_batch_size: (rank + 1) * local_batch_size]
@@ -272,35 +268,40 @@ def train_iteration(j, local_batch_size, X, lS_i, lS_o, T, ddp_model, emb_tables
     # Run forward + backward + param update
     Z, cache_group_idxs = ddp_model(X, lS_o, lS_i, emb_tables, rank)
 
-    # Broadcast cache_group idxs before starting forward and backward
-    req_obj_send = dist.broadcast(cache_group_idxs, src=rank, async_op=True)
-
-    # Make broadcast calls to recieve
-    recieve_tensors = [torch.zeros_like(cache_group_idxs)] * dist.get_world_size()
-    recieve_tensors[rank] = cache_group_idxs
-
-    req_objs_recv = []
+    # Broadcast cache_group idxs - all to all comm
+    recieve_tensors = []
+    dist_request_objs = []
     for i in range(dist.get_world_size()):
-        if i != rank:
-            req_objs_recv.append(dist.broadcast(recieve_tensors[i], src=i, async_op=True))
+        if i == rank:
+            recieve_tensors.append(cache_group_idxs)
+            dist_request_objs.append(dist.broadcast(cache_group_idxs, src=i, async_op=True))
+        else:
+            tmp = torch.empty_like(cache_group_idxs).to(rank)
+            dist_request_objs.append(dist.broadcast(tmp, src=i, async_op=True))
+            recieve_tensors.append(tmp)
 
     L = loss_fn_wrap(Z, T, loss_fn, args, loss_ws)
     L.backward()
-    aggregate_gradients(ddp_model.module, req_obj_send, req_objs_recv, recieve_tensors)
-    torch.cuda.synchronize(rank)
+    aggregate_gradients(ddp_model.module, dist_request_objs, recieve_tensors, rank, barrier)
     optimizer.step()
     optimizer.zero_grad()
 
     return L, Z, T
 
 
-def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, eviction_fifo, interprocess_batch_fifos, emb_tables, args):
+def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, eviction_fifo, interprocess_batch_fifos, emb_tables, args, barrier):
     # First pin processes to avoid context switching overhead
     avail_cores = psutil.cpu_count() - args.trainer_start_core
     stride = rank if rank < avail_cores else rank % avail_cores
     new_core = args.trainer_start_core + stride
     this_pid = os.getpid()
     os.system("taskset -p -c %d %d" % (new_core, this_pid))
+
+    np.random.seed(args.numpy_rand_seed)
+    torch.cuda.manual_seed(args.numpy_rand_seed)
+    torch.manual_seed(args.numpy_rand_seed)
+    np.set_printoptions(precision=args.print_precision)
+    torch.set_printoptions(precision=args.print_precision)
 
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
@@ -358,7 +359,7 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, evi
             for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
                 if j % args.lookahead == 0:
                     start = timer()
-                    process_lookahead_window(dlrm, batch_fifo, eviction_fifo, rank)
+                    process_lookahead_window(ddp_model.module, batch_fifo, eviction_fifo, rank)
                     end = timer()
                     caching_overhead += (end - start)
                     num_cache_steps += 1
@@ -368,7 +369,7 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, evi
 
                 start = timer()
                 L, Z, T = train_iteration(j, local_batch_size, X, lS_i, lS_o, T, ddp_model, emb_tables, loss_fn, loss_ws, optimizer,
-                                          args, rank)
+                                          args, rank, barrier)
                 end = timer()
 
                 L = L.detach().cpu().numpy()
@@ -452,19 +453,19 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, evi
 
                 start = timer()
                 L, Z, T = train_iteration(j, local_batch_size, X, lS_i, lS_o, T, ddp_model, emb_tables, loss_fn, loss_ws, optimizer,
-                                          args, rank)
+                                          args, rank, barrier)
                 end = timer()
 
                 L = L.detach().cpu().numpy()
                 S = Z.detach().cpu().numpy()
                 T = T.detach().cpu().numpy()
-                mbs = T.shape[0]
                 A = np.sum((np.round(S, 0) == T).astype(np.uint32))
 
-                L_t = torch.tensor(L, device=rank)
-                A_t = torch.tensor([A.item()], device=rank)
-                dist.broadcast(L_t, src=rank)
-                dist.broadcast(A_t, src=rank)
+                for process in range(1, dist.get_world_size()):
+                    L_t = torch.tensor(L, device=rank)
+                    A_t = torch.tensor([A.item()], device=rank)
+                    dist.broadcast(L_t, src=process)
+                    dist.broadcast(A_t, src=process)
 
                 forward_time += (end - start)
                 total_iter += 1
@@ -621,7 +622,7 @@ if __name__ == '__main__':
     spawn_context = mp.spawn(Run,
                              args=(m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld,
                                    batch_fifos, eviction_fifo, interproces_batch_fifos,
-                                   emb_tables, args),
+                                   emb_tables, args, barrier),
                              nprocs=args.world_size,
                              join=True)
 
