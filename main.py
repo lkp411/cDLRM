@@ -253,9 +253,9 @@ def aggregate_gradients(model, dist_request_objs, recieve_tensors, rank, barrier
     # Aggregate Small tables
     for i, table in enumerate(model.cache_group.emb_l):
         # if model.cache_group.undersized_map[i]:
-        unique_idxs = torch.unique(cache_lookups[i], sorted=True)
+        unique_idxs = torch.unique(cache_lookups[i], sorted=True).long()
         grad_slice = table.weight.grad[unique_idxs] / dist.get_world_size()
-        dist.all_reduce(grad_slice, async_op=False)
+        dist.all_reduce_multigpu([grad_slice], async_op=False)
 
 
 def train_iteration(j, local_batch_size, X, lS_i, lS_o, T, ddp_model, emb_tables, loss_fn, loss_ws, optimizer, args, rank, barrier):
@@ -266,7 +266,10 @@ def train_iteration(j, local_batch_size, X, lS_i, lS_o, T, ddp_model, emb_tables
     T = T[rank * local_batch_size: (rank + 1) * local_batch_size, :].to(rank)
 
     # Run forward + backward + param update
+    # start = timer()
     Z, cache_group_idxs = ddp_model(X, lS_o, lS_i, emb_tables, rank)
+    # end = timer()
+    # forward_time = end - start
 
     # Broadcast cache_group idxs - all to all comm
     recieve_tensors = []
@@ -276,17 +279,24 @@ def train_iteration(j, local_batch_size, X, lS_i, lS_o, T, ddp_model, emb_tables
             recieve_tensors.append(cache_group_idxs)
             dist_request_objs.append(dist.broadcast(cache_group_idxs, src=i, async_op=True))
         else:
-            tmp = torch.empty_like(cache_group_idxs).to(rank)
+            tmp = torch.empty_like(cache_group_idxs, device=rank)
             dist_request_objs.append(dist.broadcast(tmp, src=i, async_op=True))
             recieve_tensors.append(tmp)
 
+    # start = timer()
     L = loss_fn_wrap(Z, T, loss_fn, args, loss_ws)
     L.backward()
+    # end = timer()
+    # backward_time = end - start
+
+    # start = timer()
     aggregate_gradients(ddp_model.module, dist_request_objs, recieve_tensors, rank, barrier)
+    # end = timer()
+    # gradient_agg_time = end - start
     optimizer.step()
     optimizer.zero_grad()
 
-    return L, Z, T
+    return L, Z, T  # , forward_time, broadcast_time, backward_time, gradient_agg_time
 
 
 def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, eviction_fifo, interprocess_batch_fifos, emb_tables, args, barrier):
@@ -352,6 +362,11 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, evi
     total_loss_world = 0
     total_acc_world = 0
 
+    forward_time_avg = 0
+    broadcast_time_avg = 0
+    backward_time_avg = 0
+    agg_time_avg = 0
+
     # Don't sync any params
     with ddp_model.no_sync():
         # Only rank 0 loads training data
@@ -368,9 +383,32 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, evi
                     ib_fifo.put((X, lS_o, lS_i, T))
 
                 start = timer()
-                L, Z, T = train_iteration(j, local_batch_size, X, lS_i, lS_o, T, ddp_model, emb_tables, loss_fn, loss_ws, optimizer,
+                L, Z, T = train_iteration(j, local_batch_size, X, lS_i, lS_o, T,
+                                          ddp_model, emb_tables, loss_fn, loss_ws,
+                                          optimizer,
                                           args, rank, barrier)
+                barrier.wait()
                 end = timer()
+
+                # forward_time_avg += forward_time
+                # broadcast_time_avg += broadcast_time
+                # backward_time_avg += backward_time
+                # agg_time_avg += gradient_agg_time
+                #
+                #
+                # if j > 0 and j % 1024 == 0:
+                #     forward_time_avg /= 1024
+                #     broadcast_time_avg /= 1024
+                #     backward_time_avg /= 1024
+                #     agg_time_avg /= 1024
+                #
+                #     print('Forward = {}, Broadcast = {}, Backward = {}, Agg = {}, Total = {}'.format(1000 * forward_time_avg,
+                #                                                                                      1000 * broadcast_time_avg,
+                #                                                                                      1000 * backward_time_avg,
+                #                                                                                      1000 * agg_time_avg,
+                #                                                                                      1000 * (end - start)))
+                #
+                #     break
 
                 L = L.detach().cpu().numpy()
                 S = Z.detach().cpu().numpy()
@@ -452,9 +490,15 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, evi
                 X, lS_o, lS_i, T = ib_fifo.get()
 
                 start = timer()
-                L, Z, T = train_iteration(j, local_batch_size, X, lS_i, lS_o, T, ddp_model, emb_tables, loss_fn, loss_ws, optimizer,
+                L, Z, T = train_iteration(j, local_batch_size, X, lS_i, lS_o, T,
+                                          ddp_model, emb_tables, loss_fn, loss_ws,
+                                          optimizer,
                                           args, rank, barrier)
+                barrier.wait()
                 end = timer()
+
+                # if j > 0 and j % 1024 == 0:
+                #     break
 
                 L = L.detach().cpu().numpy()
                 S = Z.detach().cpu().numpy()
@@ -466,24 +510,6 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, evi
                     A_t = torch.tensor([A.item()], device=rank)
                     dist.broadcast(L_t, src=process)
                     dist.broadcast(A_t, src=process)
-
-                forward_time += (end - start)
-                total_iter += 1
-
-                if j > 0 and j % args.print_freq == 0:
-                    avg_caching_overhead = caching_overhead / (num_cache_steps * args.lookahead)
-                    avg_forward_time = forward_time / total_iter
-
-                    print('Iteration = {}: Rank = {}, Avg Caching Overhead = {}, Avg Iteration Time = {}'.format(j,
-                                                                                                                 rank,
-                                                                                                                 1000 * avg_caching_overhead,
-                                                                                                                 1000 * avg_forward_time,
-                                                                                                                 ))
-
-                    forward_time = 0
-                    caching_overhead = 0
-                    num_cache_steps = 0
-                    total_iter = 0
 
 
 if __name__ == '__main__':

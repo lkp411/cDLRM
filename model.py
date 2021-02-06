@@ -204,7 +204,7 @@ class Embedding_Table_Cache_Group(nn.Module):
 
             V = E(cache_lookup_idxs, sparse_offset_group_batch)  # 2048 x 64 tensor
             ly.append(V)
-            cache_group_idxs.append(cache_lookup_idxs)
+            cache_group_idxs.append(cache_lookup_idxs.int())
 
         # hit_rate = hit_positions.shape[0] / sparse_index_group_batch.shape[0]
         # per_table_hit_rates.append(hit_rate)

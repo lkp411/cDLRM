@@ -21,9 +21,9 @@ class Prefetcher(mp.Process):
         self.cache_ld = cache_ld
 
     @staticmethod
-    def pin_pool(p):
+    def pin_pool(p, core):
         this_pid = os.getpid()
-        os.system("taskset -p -c %d %d" % (3 + p, this_pid))
+        os.system("taskset -p -c %d %d" % (core + 3 + p, this_pid))
 
         return 1
 
@@ -45,10 +45,10 @@ class Prefetcher(mp.Process):
         return cached_entries_per_table, lists_of_unique_indices, unique_indices_maps
 
     @staticmethod
-    def eviction_manager(emb_tables, eviction_fifo, average_on_writeback):
+    def eviction_manager(emb_tables, eviction_fifo, average_on_writeback, core):
         this_pid = os.getpid()
         print('Pinning eviction process...')
-        os.system("taskset -p -c %d %d" % (2, this_pid))
+        os.system("taskset -p -c %d %d" % (core, this_pid))
         print('Done pinning eviction process')
 
         try:
@@ -63,8 +63,11 @@ class Prefetcher(mp.Process):
             print('Eviction queue empty longer than expected. Exiting eviction manager...')
 
     def run(self):
+        this_pid = os.getpid()
+        os.system("taskset -p -c %d %d" % (self.args.main_start_core + 1, this_pid))
+
         eviction_process = mp.Process(target=Prefetcher.eviction_manager,
-                                      args=(self.emb_tables_cpu, self.eviction_fifo, self.args.average_on_writeback))
+                                      args=(self.emb_tables_cpu, self.eviction_fifo, self.args.average_on_writeback, self.args.main_start_core + 2))
         eviction_process.start()
 
         num_examples_per_process = self.args.lookahead * self.args.mini_batch_size
@@ -75,7 +78,7 @@ class Prefetcher(mp.Process):
         print('Created pool')
 
         print('Pinning processes')
-        results = [pool.apply_async(Prefetcher.pin_pool, args=(p,)) for p in range(self.args.cache_workers)]
+        results = [pool.apply_async(Prefetcher.pin_pool, args=(p, self.args.main_start_core)) for p in range(self.args.cache_workers)]
         for res in results:
             res.get()
         print('Done pinning processes. Starting cache manager.')

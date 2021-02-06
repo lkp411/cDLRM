@@ -29,7 +29,6 @@ import data_utils
 import numpy as np
 from numpy import random as ra
 
-
 # pytorch
 import torch
 from torch.utils.data import Dataset, RandomSampler
@@ -71,7 +70,7 @@ class CriteoDataset(Dataset):
             days = 24
             out_file = "terabyte_processed"
         else:
-            raise(ValueError("Data set option is not supported"))
+            raise (ValueError("Data set option is not supported"))
         self.max_ind_range = max_ind_range
         self.memory_map = memory_map
 
@@ -194,14 +193,14 @@ class CriteoDataset(Dataset):
                 with np.load(fi) as data:
                     self.X_int = data["X_int"]  # continuous  feature
                     self.X_cat = data["X_cat"]  # categorical feature
-                    self.y = data["y"]          # target
+                    self.y = data["y"]  # target
 
         else:
             # load and preprocess data
             with np.load(file) as data:
                 X_int = data["X_int"]  # continuous  feature
                 X_cat = data["X_cat"]  # categorical feature
-                y = data["y"]          # target
+                y = data["y"]  # target
                 self.counts = data["counts"]
             self.m_den = X_int.shape[1]  # den_fea
             self.n_emb = len(self.counts)
@@ -278,7 +277,7 @@ class CriteoDataset(Dataset):
                     with np.load(fi) as data:
                         self.X_int = data["X_int"]  # continuous  feature
                         self.X_cat = data["X_cat"]  # categorical feature
-                        self.y = data["y"]          # target
+                        self.y = data["y"]  # target
                     self.day = (self.day + 1) % self.max_day_range
 
                 i = index - self.day_boundary
@@ -327,8 +326,8 @@ def collate_wrapper_criteo(list_of_tuples):
     X_int = torch.log(torch.tensor(transposed_data[0], dtype=torch.float) + 1)
     X_cat = torch.tensor(transposed_data[1], dtype=torch.long)
     T = torch.tensor(transposed_data[2], dtype=torch.float32).view(-1, 1)
-	
-	#import pdb; pdb.set_trace()
+
+    # import pdb; pdb.set_trace()
 
     batchSize = X_cat.shape[0]
     featureCnt = X_cat.shape[1]
@@ -337,10 +336,11 @@ def collate_wrapper_criteo(list_of_tuples):
     lS_o = [torch.tensor(range(batchSize)) for _ in range(featureCnt)]
 
     return X_int, torch.stack(lS_o), torch.stack(lS_i), T
-	
+
+
 def criteo_worker_pin_fn(worker_id):
-	this_pid = os.getpid()
-	os.system("taskset -p -c %d %d" % (13 + worker_id, this_pid))
+    this_pid = os.getpid()
+    os.system("taskset -p -c %d %d" % (13 + worker_id, this_pid))
 
 
 def ensure_dataset_preprocessed(args, d_path):
@@ -384,7 +384,6 @@ def ensure_dataset_preprocessed(args, d_path):
 
 
 def make_criteo_data_and_loaders(args):
-
     if args.large_batch and args.memory_map and args.data_set == "terabyte":
         # more efficient for larger batches
         data_directory = path.dirname(args.raw_data_file)
@@ -469,16 +468,18 @@ def make_criteo_data_and_loaders(args):
                 days=list(range(23)),
                 batch_size=args.mini_batch_size,
                 max_ind_range=args.max_ind_range,
-                split="train"
+                split="train",
+                drop_last_batch=True
             )
 
             cache_loader = data_loader_terabyte.DataLoader(
                 data_directory=data_directory,
                 data_filename=data_filename,
                 days=list(range(23)),
-                batch_size=args.cache_workers*args.lookahead*args.mini_batch_size,
+                batch_size=args.cache_workers * args.lookahead * args.mini_batch_size,
                 max_ind_range=args.max_ind_range,
-                split="train"
+                split="train",
+                drop_last_batch=True
             )
 
             test_loader = data_loader_terabyte.DataLoader(
@@ -524,14 +525,14 @@ def make_criteo_data_and_loaders(args):
         )
 
         cache_loader = torch.utils.data.DataLoader(
-		    train_data,
-            batch_size=args.cache_workers*args.lookahead*args.mini_batch_size,
+            train_data,
+            batch_size=args.cache_workers * args.lookahead * args.mini_batch_size,
             shuffle=False,
             num_workers=1,
             collate_fn=collate_wrapper_criteo,
             pin_memory=False,
             drop_last=False
-        )	
+        )
 
         test_loader = torch.utils.data.DataLoader(
             test_data,
@@ -655,7 +656,6 @@ def collate_wrapper_random(list_of_tuples):
 
 
 def make_random_data_and_loader(args, ln_emb, m_den):
-
     train_data = RandomDataset(
         m_den,
         ln_emb,
@@ -685,18 +685,18 @@ def make_random_data_and_loader(args, ln_emb, m_den):
 
 
 def generate_random_data(
-    m_den,
-    ln_emb,
-    data_size,
-    num_batches,
-    mini_batch_size,
-    num_indices_per_lookup,
-    num_indices_per_lookup_fixed,
-    num_targets=1,
-    round_targets=False,
-    data_generation="random",
-    trace_file="",
-    enable_padding=False,
+        m_den,
+        ln_emb,
+        data_size,
+        num_batches,
+        mini_batch_size,
+        num_indices_per_lookup,
+        num_indices_per_lookup_fixed,
+        num_targets=1,
+        round_targets=False,
+        data_generation="random",
+        trace_file="",
+        enable_padding=False,
 ):
     nbatches = int(np.ceil((data_size * 1.0) / mini_batch_size))
     if num_batches != 0:
@@ -761,11 +761,11 @@ def generate_random_output_batch(n, num_targets, round_targets=False):
 
 # uniform ditribution (input data)
 def generate_uniform_input_batch(
-    m_den,
-    ln_emb,
-    n,
-    num_indices_per_lookup,
-    num_indices_per_lookup_fixed,
+        m_den,
+        ln_emb,
+        n,
+        num_indices_per_lookup,
+        num_indices_per_lookup_fixed,
 ):
     # dense feature
     Xt = torch.tensor(ra.rand(n, m_den).astype(np.float32))
@@ -807,13 +807,13 @@ def generate_uniform_input_batch(
 
 # synthetic distribution (input data)
 def generate_synthetic_input_batch(
-    m_den,
-    ln_emb,
-    n,
-    num_indices_per_lookup,
-    num_indices_per_lookup_fixed,
-    trace_file,
-    enable_padding=False,
+        m_den,
+        ln_emb,
+        n,
+        num_indices_per_lookup,
+        num_indices_per_lookup_fixed,
+        trace_file,
+        enable_padding=False,
 ):
     # dense feature
     Xt = torch.tensor(ra.rand(n, m_den).astype(np.float32))
@@ -902,7 +902,7 @@ cache_line_size = 1
 
 
 def trace_generate_lru(
-    line_accesses, list_sd, cumm_sd, out_trace_len, enable_padding=False
+        line_accesses, list_sd, cumm_sd, out_trace_len, enable_padding=False
 ):
     max_sd = list_sd[-1]
     l = len(line_accesses)
@@ -930,7 +930,7 @@ def trace_generate_lru(
 
 
 def trace_generate_rand(
-    line_accesses, list_sd, cumm_sd, out_trace_len, enable_padding=False
+        line_accesses, list_sd, cumm_sd, out_trace_len, enable_padding=False
 ):
     max_sd = list_sd[-1]
     l = len(line_accesses)  # !!!Unique,
@@ -1024,7 +1024,7 @@ def write_trace_to_file(file_path, trace):
         else:
             with open(file_path, "w+") as f:
                 s = str(trace)
-                f.write(s[1 : len(s) - 1])
+                f.write(s[1: len(s) - 1])
     except Exception:
         print("ERROR: no output trace file has been provided")
 
@@ -1049,13 +1049,13 @@ def write_dist_to_file(file_path, unique_accesses, list_sd, cumm_sd):
         with open(file_path, "w") as f:
             # unique_acesses
             s = str(unique_accesses)
-            f.write(s[1 : len(s) - 1] + "\n")
+            f.write(s[1: len(s) - 1] + "\n")
             # list_sd
             s = str(list_sd)
-            f.write(s[1 : len(s) - 1] + "\n")
+            f.write(s[1: len(s) - 1] + "\n")
             # cumm_sd
             s = str(cumm_sd)
-            f.write(s[1 : len(s) - 1] + "\n")
+            f.write(s[1: len(s) - 1] + "\n")
     except Exception:
         print("Wrong file or file path")
 
