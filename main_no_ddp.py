@@ -130,6 +130,7 @@ def ProcessArgs():
     parser.add_argument("--trainer-start-core", type=int, default=7)
     parser.add_argument("--main-start-core", type=int, default=0)
     parser.add_argument("--dense-threshold", type=int, default=1000)
+    parser.add_argument("--table-agg-op", type=str, default="mean")
     parser.add_argument("--table-agg-freq", type=int, default=1)
     ########################################################################################
 
@@ -249,7 +250,7 @@ def aggregate_gradients(dlrm):
 
 
 @torch.no_grad()
-def broadcast_and_aggregate(dlrm, cache_group, cache_group_idxs, rank):
+def broadcast_and_aggregate(dlrm, cache_group, cache_group_idxs, rank, reduce_op="mean"):
     recieve_tensors = []
     dist_request_objs = []
     for i in range(dist.get_world_size()):
@@ -267,8 +268,20 @@ def broadcast_and_aggregate(dlrm, cache_group, cache_group_idxs, rank):
     cache_lookups = torch.cat(recieve_tensors, dim=1)
     for i, table in enumerate(cache_group.emb_l):
         unique_idxs = torch.unique(cache_lookups[i], sorted=True).long()
-        weight_slice = table.weight[unique_idxs] / dist.get_world_size()
-        dist.all_reduce_multigpu([weight_slice], async_op=True)
+
+        if reduce_op == "sum":
+            weight_slice = table.weight[unique_idxs]
+            op = dist.ReduceOp.SUM
+
+        elif reduce_op == "mean":
+            weight_slice = table.weight[unique_idxs] / dist.get_world_size()
+            op = dist.ReduceOp.SUM
+
+        elif reduce_op == "max":
+            weight_slice = table.weight[unique_idxs]
+            op = dist.ReduceOp.MAX
+
+        dist.all_reduce_multigpu([weight_slice], op=op, async_op=True)
 
 
 def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, eviction_fifo, interprocess_batch_fifos, emb_tables, args, barrier):
@@ -368,7 +381,7 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, evi
         # Aggregate parameters for cache group
         if j > 0 and j % args.table_agg_freq == 0:
             cache_group_idxs = torch.cat(cache_group_idxs_window + [torch.stack(cache_group_idxs)], dim=1)
-            broadcast_and_aggregate(dlrm, cache_group, cache_group_idxs, rank)
+            broadcast_and_aggregate(dlrm, cache_group, cache_group_idxs, rank, args.table_agg_op)
             cache_group_idxs_window = []
         else:
             cache_group_idxs_window.append(torch.stack(cache_group_idxs))
