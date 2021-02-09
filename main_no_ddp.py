@@ -229,8 +229,7 @@ def time_wrap(rank):
 
 def wait_wrap(req_objs):
     for obj in req_objs:
-        while not obj.is_completed():
-            continue
+        obj.wait()
 
 
 def aggregate_gradients(dlrm):
@@ -266,6 +265,9 @@ def broadcast_and_aggregate(dlrm, cache_group, cache_group_idxs, rank, reduce_op
     wait_wrap(dist_request_objs)
 
     cache_lookups = torch.cat(recieve_tensors, dim=1)
+    dist_request_objs = []
+    unique_idxs_list = []
+    weight_slices = []
     for i, table in enumerate(cache_group.emb_l):
         unique_idxs = torch.unique(cache_lookups[i], sorted=True).long()
 
@@ -281,7 +283,16 @@ def broadcast_and_aggregate(dlrm, cache_group, cache_group_idxs, rank, reduce_op
             weight_slice = table.weight[unique_idxs]
             op = dist.ReduceOp.MAX
 
-        dist.all_reduce_multigpu([weight_slice], op=op, async_op=True)
+        dist_request_objs.append(dist.all_reduce_multigpu([weight_slice], op=op, async_op=False))
+        table.weight[unique_idxs] = weight_slice
+    #     unique_idxs_list.append(unique_idxs)
+    #     weight_slices.append(weight_slice)
+    #
+    # for i, obj in enumerate(dist_request_objs):
+    #     obj.wait()
+    #     unique_idxs = unique_idxs_list[i]
+    #     weight_slice = weight_slices[i]
+    #     table.weight[unique_idxs] = weight_slice
 
 
 def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, eviction_fifo, interprocess_batch_fifos, emb_tables, args, barrier):
