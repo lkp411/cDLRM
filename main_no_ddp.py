@@ -596,9 +596,8 @@ if __name__ == '__main__':
     emb_tables = Embedding_Table_Group(m_spa, ln_emb)
     emb_tables.share_memory()
 
-    # batch_fifos = [mp.Manager().Queue(maxsize=5)] * args.world_size
-    batch_fifos = [mp.Manager().Queue(maxsize=8)] * args.world_size
-    eviction_fifo = mp.Manager().Queue(maxsize=5)
+    batch_fifos = [mp.Manager().Queue(maxsize=128)] * args.world_size
+    eviction_fifo = mp.Manager().Queue(maxsize=10)
     interproces_batch_fifos = [mp.Manager().Queue(maxsize=1)] * (args.world_size - 1)
     finish_event = mp.Event()
     barrier = mp.Barrier(args.world_size)

@@ -4,6 +4,7 @@ import gc
 
 import torch
 import torch.multiprocessing as mp
+from timeit import default_timer as timer
 
 import dlrm_data_pytorch as dp
 
@@ -33,11 +34,15 @@ class Prefetcher(mp.Process):
         unique_indices_maps = []
         for i in range(len(emb_tables_cpu.emb_l)):
             unique_indices_tensor = torch.unique(slice[i])  # .long()
+            unique_indices_tensor.share_memory_()
             lists_of_unique_indices.append(unique_indices_tensor)
+
             idxs = torch.arange(unique_indices_tensor.shape[0])
             max = torch.max(unique_indices_tensor)
             map = -1 * torch.ones(max + 1, 1, dtype=torch.long)
             map[unique_indices_tensor] = idxs.view(-1, 1)
+            map.share_memory_()
+
             unique_indices_maps.append(map)
 
         cached_entries_per_table = emb_tables_cpu.fetch_unique_idx_slices(lists_of_unique_indices)
@@ -72,12 +77,8 @@ class Prefetcher(mp.Process):
 
         num_examples_per_process = self.args.lookahead * self.args.mini_batch_size
 
-        #_, _, _, _, cache_ld = dp.make_criteo_data_and_loaders(self.args)
-
         pool = mp.Pool(processes=self.args.cache_workers)
-        print('Created pool')
 
-        print('Pinning processes')
         results = [pool.apply_async(Prefetcher.pin_pool, args=(p, self.args.main_start_core)) for p in range(self.args.cache_workers)]
         for res in results:
             res.get()
@@ -91,9 +92,9 @@ class Prefetcher(mp.Process):
                     lS_i[:, p * num_examples_per_process:  (p + 1) * num_examples_per_process], self.emb_tables_cpu)) for p
                                     in range(num_processes_needed)]
 
-                for res in processed_slices:
-                    a = res.get()
+                results = [res.get() for res in processed_slices]
 
+                for a in results:
                     for batch_fifo in self.batch_fifos:
                         batch_fifo.put((a[0], a[1], a[2]))
 

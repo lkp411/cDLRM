@@ -479,7 +479,7 @@ def make_criteo_data_and_loaders(args):
                 batch_size=args.cache_workers * args.lookahead * args.mini_batch_size,
                 max_ind_range=args.max_ind_range,
                 split="train",
-                drop_last_batch=True
+                drop_last_batch=False
             )
 
             test_loader = data_loader_terabyte.DataLoader(
