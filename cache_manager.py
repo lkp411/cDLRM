@@ -10,13 +10,13 @@ import dlrm_data_pytorch as dp
 
 
 class Prefetcher(mp.Process):
-    def __init__(self, args, emb_tables_cpu, batch_fifos, eviction_fifo, finish_event, cache_ld):
+    def __init__(self, args, emb_tables_cpu, batch_fifo, eviction_fifo, finish_event, cache_ld):
         mp.Process.__init__(self)
 
         # Shared variables
         self.args = args
         self.emb_tables_cpu = emb_tables_cpu
-        self.batch_fifos = batch_fifos
+        self.batch_fifo = batch_fifo
         self.eviction_fifo = eviction_fifo
         self.finish_event = finish_event
         self.cache_ld = cache_ld
@@ -95,8 +95,7 @@ class Prefetcher(mp.Process):
                 results = [res.get() for res in processed_slices]
 
                 for a in results:
-                    for batch_fifo in self.batch_fifos:
-                        batch_fifo.put((a[0], a[1], a[2]))
+                    self.batch_fifo.put((a[0], a[1], a[2]))
 
         pool.close()
         pool.join()

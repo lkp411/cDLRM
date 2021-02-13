@@ -203,9 +203,6 @@ def CacheEmbeddings(cached_entries_per_table, lists_of_unique_idxs, unique_indic
         cached_table_idxs = map[necessary_unique_idxs].flatten()
         cache_group.emb_l[k].weight.data[table_idxs] = table_cache[cached_table_idxs].to(rank)
 
-    # For now only update with the embeddings from gpu1.
-    # In reality, even though all GPUs have the same embeddings as a result of gradient averaging, the randomness
-    # in caching could result in each process selecting different ways for the same indices. Can consider later
     if rank == 0:
         eviction_fifo.put(eviction_data)
 
@@ -249,7 +246,7 @@ def aggregate_gradients(dlrm):
 
 
 @torch.no_grad()
-def broadcast_and_aggregate(dlrm, cache_group, cache_group_idxs, rank, reduce_op="mean"):
+def broadcast_and_aggregate(cache_group, cache_group_idxs, rank, reduce_op="mean"):
     recieve_tensors = []
     dist_request_objs = []
     for i in range(dist.get_world_size()):
@@ -265,9 +262,6 @@ def broadcast_and_aggregate(dlrm, cache_group, cache_group_idxs, rank, reduce_op
     wait_wrap(dist_request_objs)
 
     cache_lookups = torch.cat(recieve_tensors, dim=1)
-    dist_request_objs = []
-    unique_idxs_list = []
-    weight_slices = []
     for i, table in enumerate(cache_group.emb_l):
         unique_idxs = torch.unique(cache_lookups[i], sorted=True).long()
 
@@ -283,19 +277,40 @@ def broadcast_and_aggregate(dlrm, cache_group, cache_group_idxs, rank, reduce_op
             weight_slice = table.weight[unique_idxs]
             op = dist.ReduceOp.MAX
 
-        dist_request_objs.append(dist.all_reduce_multigpu([weight_slice], op=op, async_op=False))
+        dist.all_reduce_multigpu([weight_slice], op=op, async_op=False)  # Micro-optimization - make all_reduce async
         table.weight[unique_idxs] = weight_slice
-    #     unique_idxs_list.append(unique_idxs)
-    #     weight_slices.append(weight_slice)
-    #
-    # for i, obj in enumerate(dist_request_objs):
-    #     obj.wait()
-    #     unique_idxs = unique_idxs_list[i]
-    #     weight_slice = weight_slices[i]
-    #     table.weight[unique_idxs] = weight_slice
 
 
-def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, eviction_fifo, interprocess_batch_fifos, emb_tables, args, barrier):
+def share_occupancy_tables(cache_group, occupancy_tables_fifos, rank):
+    if rank == 0:
+        for table in cache_group.occupancy_tables:
+            table.share_memory_()
+
+        for fifo in occupancy_tables_fifos:
+            fifo.put(cache_group.occupancy_tables)
+
+    else:
+        fifo = occupancy_tables_fifos[rank - 1]
+        shared_occupancy_tables = fifo.get()
+        cache_group.occupancy_tables = shared_occupancy_tables
+
+
+@torch.no_grad()
+def load_caches_and_broadcast(cache_group, batch_fifo, eviction_fifo, rank):
+    dist_req_objs = []
+    if rank == 0:
+        # Pull out of batch queue and cache in cache on GPU 0
+        cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps = batch_fifo.get()
+        CacheEmbeddings(cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps, cache_group, eviction_fifo, rank)
+
+    # Broadcast to all other GPUs
+    for embedding_table_cache in cache_group.emb_l:
+        dist_req_objs.append(dist.broadcast_multigpu([embedding_table_cache.weight], src=0, async_op=True))
+
+    return dist_req_objs
+
+
+def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifo, eviction_fifo, occupancy_tables_fifos, emb_tables, args):
     # First pin processes to avoid context switching overhead
     avail_cores = psutil.cpu_count() - args.trainer_start_core
     stride = rank if rank < avail_cores else rank % avail_cores
@@ -336,6 +351,8 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, evi
         loss_threshold=args.loss_threshold,
     ).to(rank)
 
+    share_occupancy_tables(cache_group, occupancy_tables_fifos, rank)
+
     if args.loss_function == "mse":
         loss_fn = torch.nn.MSELoss(reduction="mean")
         loss_ws = None
@@ -358,7 +375,6 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, evi
 
     caching_overhead = []
     cache_group_idxs_window = []
-    batch_fifo = batch_fifos[rank]
     for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
         X = X[rank * local_batch_size: (rank + 1) * local_batch_size, :].to(rank)
         lS_i = lS_i[:, rank * local_batch_size: (rank + 1) * local_batch_size]
@@ -368,8 +384,8 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, evi
         if j % args.lookahead == 0:
             # Pull from fifo and setup caches
             start = timer()
-            cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps = batch_fifo.get()
-            CacheEmbeddings(cached_entries_per_table, lists_of_unique_idxs, unique_indices_maps, cache_group, eviction_fifo, rank)
+            dist_req_objs = load_caches_and_broadcast(cache_group, batch_fifo, eviction_fifo, rank)
+            wait_wrap(dist_req_objs)
             end = timer()
             caching_overhead.append(end - start)
 
@@ -392,7 +408,7 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifos, evi
         # Aggregate parameters for cache group
         if j > 0 and j % args.table_agg_freq == 0:
             cache_group_idxs = torch.cat(cache_group_idxs_window + [torch.stack(cache_group_idxs)], dim=1)
-            broadcast_and_aggregate(dlrm, cache_group, cache_group_idxs, rank, args.table_agg_op)
+            broadcast_and_aggregate(cache_group, cache_group_idxs, rank, args.table_agg_op)
             cache_group_idxs_window = []
         else:
             cache_group_idxs_window.append(torch.stack(cache_group_idxs))
@@ -596,13 +612,13 @@ if __name__ == '__main__':
     emb_tables = Embedding_Table_Group(m_spa, ln_emb)
     emb_tables.share_memory()
 
-    batch_fifos = [mp.Manager().Queue(maxsize=128)] * args.world_size
+    batch_fifo = mp.Manager().Queue(maxsize=128)
     eviction_fifo = mp.Manager().Queue(maxsize=10)
-    interproces_batch_fifos = [mp.Manager().Queue(maxsize=1)] * (args.world_size - 1)
+    occupancy_tables_fifos = [mp.Manager().Queue(maxsize=1)] * (args.world_size - 1)
     finish_event = mp.Event()
     barrier = mp.Barrier(args.world_size)
 
-    cm = Prefetcher(args, emb_tables, batch_fifos, eviction_fifo, finish_event, cache_ld)
+    cm = Prefetcher(args, emb_tables, batch_fifo, eviction_fifo, finish_event, cache_ld)
 
     # Pin main process
     this_pid = os.getpid()
@@ -612,8 +628,8 @@ if __name__ == '__main__':
     cm.start()
     spawn_context = mp.spawn(Run,
                              args=(m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld,
-                                   batch_fifos, eviction_fifo, interproces_batch_fifos,
-                                   emb_tables, args, barrier),
+                                   batch_fifo, eviction_fifo, occupancy_tables_fifos,
+                                   emb_tables, args),
                              nprocs=args.world_size,
                              join=True)
 
