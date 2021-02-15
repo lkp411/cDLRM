@@ -1,6 +1,5 @@
 import argparse
 import builtins
-import itertools
 import math
 import os
 import sys
@@ -20,7 +19,6 @@ import torch
 import torch.nn as nn
 import torch.multiprocessing as mp
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 # quotient-remainder trick
 # mixed-dimension trick
@@ -260,7 +258,9 @@ def broadcast_and_aggregate(cache_group, cache_group_idxs, rank, reduce_op="mean
 
     # Wait for broadcasts to finish
     wait_wrap(dist_request_objs)
-
+    unique_idxs_list = []
+    weight_slice_list = []
+    dist_request_objs = []
     cache_lookups = torch.cat(recieve_tensors, dim=1)
     for i, table in enumerate(cache_group.emb_l):
         unique_idxs = torch.unique(cache_lookups[i], sorted=True).long()
@@ -277,7 +277,14 @@ def broadcast_and_aggregate(cache_group, cache_group_idxs, rank, reduce_op="mean
             weight_slice = table.weight[unique_idxs]
             op = dist.ReduceOp.MAX
 
-        dist.all_reduce_multigpu([weight_slice], op=op, async_op=False)  # Micro-optimization - make all_reduce async
+        dist_request_objs.append(dist.all_reduce_multigpu([weight_slice], op=op, async_op=True))
+        unique_idxs_list.append(unique_idxs)
+        weight_slice_list.append(weight_slice)
+
+    for i, table in enumerate(cache_group.emb_l):
+        unique_idxs = unique_idxs_list[i]
+        weight_slice = weight_slice_list[i]
+        dist_request_objs[i].wait()
         table.weight[unique_idxs] = weight_slice
 
 
@@ -612,7 +619,7 @@ if __name__ == '__main__':
     emb_tables = Embedding_Table_Group(m_spa, ln_emb)
     emb_tables.share_memory()
 
-    batch_fifo = mp.Manager().Queue(maxsize=128)
+    batch_fifo = mp.Manager().Queue(maxsize=256)
     eviction_fifo = mp.Manager().Queue(maxsize=10)
     occupancy_tables_fifos = [mp.Manager().Queue(maxsize=1)] * (args.world_size - 1)
     finish_event = mp.Event()

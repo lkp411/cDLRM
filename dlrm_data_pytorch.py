@@ -476,7 +476,7 @@ def make_criteo_data_and_loaders(args):
                 data_directory=data_directory,
                 data_filename=data_filename,
                 days=list(range(23)),
-                batch_size=args.cache_workers * args.lookahead * args.mini_batch_size,
+                batch_size=args.mini_batch_size,
                 max_ind_range=args.max_ind_range,
                 split="train",
                 drop_last_batch=False

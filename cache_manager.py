@@ -1,12 +1,8 @@
 import math
 import os
-import gc
 
 import torch
 import torch.multiprocessing as mp
-from timeit import default_timer as timer
-
-import dlrm_data_pytorch as dp
 
 
 class Prefetcher(mp.Process):
@@ -58,7 +54,7 @@ class Prefetcher(mp.Process):
 
         try:
             while (True):
-                eviction_data = eviction_fifo.get(timeout=1000)
+                eviction_data = eviction_fifo.get(timeout=300)
                 for k, table_eviction_data in enumerate(eviction_data):
                     idxs = table_eviction_data[0]
                     embeddings = table_eviction_data[1]
@@ -84,18 +80,31 @@ class Prefetcher(mp.Process):
             res.get()
         print('Done pinning processes. Starting cache manager.')
 
+        lS_i = []
+        collection_limit = self.args.lookahead * self.args.cache_workers
+        collected = 0
         for epoch in range(self.args.nepochs):
-            for j, (X, lS_o, lS_i, T) in enumerate(self.cache_ld):
-                num_processes_needed = math.ceil(lS_i.shape[1] / num_examples_per_process)
+            for j, (_, _, sparse_idxs, _) in enumerate(self.cache_ld):
+                if (j > 0 and collected % collection_limit == 0) or j == len(self.cache_ld) - 1:
+                    if j == len(self.cache_ld) - 1:
+                        lS_i.append(sparse_idxs)
 
-                processed_slices = [pool.apply_async(Prefetcher.process_batch_slice, args=(
-                    lS_i[:, p * num_examples_per_process:  (p + 1) * num_examples_per_process], self.emb_tables_cpu)) for p
-                                    in range(num_processes_needed)]
+                    lS_i = torch.cat(lS_i, dim=1)
+                    num_processes_needed = math.ceil(lS_i.shape[1] / num_examples_per_process)
 
-                results = [res.get() for res in processed_slices]
+                    processed_slices = [pool.apply_async(Prefetcher.process_batch_slice, args=(
+                        lS_i[:, p * num_examples_per_process:  (p + 1) * num_examples_per_process], self.emb_tables_cpu)) for p
+                                        in range(num_processes_needed)]
 
-                for a in results:
-                    self.batch_fifo.put((a[0], a[1], a[2]))
+                    for res in processed_slices:
+                        a = res.get()
+                        self.batch_fifo.put((a[0], a[1], a[2]))
+
+                    lS_i = [sparse_idxs]
+                    collected = 1
+                else:
+                    lS_i.append(sparse_idxs)
+                    collected += 1
 
         pool.close()
         pool.join()
