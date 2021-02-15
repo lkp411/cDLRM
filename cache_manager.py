@@ -54,7 +54,7 @@ class Prefetcher(mp.Process):
 
         try:
             while (True):
-                eviction_data = eviction_fifo.get(timeout=300)
+                eviction_data = eviction_fifo.get(timeout=500)
                 for k, table_eviction_data in enumerate(eviction_data):
                     idxs = table_eviction_data[0]
                     embeddings = table_eviction_data[1]
