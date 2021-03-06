@@ -46,7 +46,7 @@ class Prefetcher(mp.Process):
         return cached_entries_per_table, lists_of_unique_indices, unique_indices_maps
 
     @staticmethod
-    def eviction_manager(emb_tables, eviction_fifo, average_on_writeback, core):
+    def eviction_manager(emb_tables, eviction_fifo, average_on_writeback, core, timeout):
         this_pid = os.getpid()
         print('Pinning eviction process...')
         os.system("taskset -p -c %d %d" % (core, this_pid))
@@ -54,7 +54,7 @@ class Prefetcher(mp.Process):
 
         try:
             while (True):
-                eviction_data = eviction_fifo.get(timeout=500)
+                eviction_data = eviction_fifo.get(timeout=timeout) if timeout > 0 else eviction_fifo.get()
                 for k, table_eviction_data in enumerate(eviction_data):
                     idxs = table_eviction_data[0]
                     embeddings = table_eviction_data[1]
@@ -68,7 +68,8 @@ class Prefetcher(mp.Process):
         os.system("taskset -p -c %d %d" % (self.args.main_start_core + 1, this_pid))
 
         eviction_process = mp.Process(target=Prefetcher.eviction_manager,
-                                      args=(self.emb_tables_cpu, self.eviction_fifo, self.args.average_on_writeback, self.args.main_start_core + 2))
+                                      args=(self.emb_tables_cpu, self.eviction_fifo, self.args.average_on_writeback, self.args.main_start_core + 2,
+                                            self.args.eviction_fifo_timeout))
         eviction_process.start()
 
         num_examples_per_process = self.args.lookahead * self.args.mini_batch_size

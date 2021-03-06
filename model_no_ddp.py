@@ -215,16 +215,10 @@ class Embedding_Table_Cache_Group(nn.Module):
 class DLRM_Net(nn.Module):
     def __init__(
             self,
-            m_spa=None,
-            ln_emb=None,
             ln_bot=None,
             ln_top=None,
             arch_interaction_op=None,
             arch_interaction_itself=False,
-            max_cache_size=None,
-            aux_table_size=None,
-            dense_threshold=None,
-            num_ways=None,
             sync_dense_params=True,
             sigmoid_bot=-1,
             sigmoid_top=-1,

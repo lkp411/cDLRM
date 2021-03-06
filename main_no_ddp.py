@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import warnings
+from setproctitle import setproctitle
 
 import numpy as np
 import psutil
@@ -130,6 +131,9 @@ def ProcessArgs():
     parser.add_argument("--dense-threshold", type=int, default=1000)
     parser.add_argument("--table-agg-op", type=str, default="mean")
     parser.add_argument("--table-agg-freq", type=int, default=1)
+    parser.add_argument("--batch-fifo-size", type=int, default=8)
+    parser.add_argument("--eviction-fifo-size", type=int, default=8)
+    parser.add_argument("--eviction-fifo-timeout", type=int, default=300)
     ########################################################################################
 
     ######################################## Misc ##########################################
@@ -318,6 +322,9 @@ def load_caches_and_broadcast(cache_group, batch_fifo, eviction_fifo, rank):
 
 
 def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifo, eviction_fifo, occupancy_tables_fifos, emb_tables, args):
+    # Set proc title
+    setproctitle("DlrmTrainer:" + str(rank))
+
     # First pin processes to avoid context switching overhead
     avail_cores = psutil.cpu_count() - args.trainer_start_core
     stride = rank if rank < avail_cores else rank % avail_cores
@@ -342,16 +349,10 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifo, evic
                                               num_ways=args.num_ways).to(rank)
 
     dlrm = DLRM_Net(
-        m_spa,
-        ln_emb,
         ln_bot,
         ln_top,
         arch_interaction_op=args.arch_interaction_op,
         arch_interaction_itself=args.arch_interaction_itself,
-        max_cache_size=args.cache_size,
-        aux_table_size=local_batch_size,
-        dense_threshold=args.dense_threshold,
-        num_ways=args.num_ways,
         sync_dense_params=args.sync_dense_params,
         sigmoid_bot=-1,
         sigmoid_top=ln_top.size - 2,
@@ -619,8 +620,8 @@ if __name__ == '__main__':
     emb_tables = Embedding_Table_Group(m_spa, ln_emb)
     emb_tables.share_memory()
 
-    batch_fifo = mp.Manager().Queue(maxsize=256)
-    eviction_fifo = mp.Manager().Queue(maxsize=10)
+    batch_fifo = mp.Manager().Queue(maxsize=args.batch_fifo_size)
+    eviction_fifo = mp.Manager().Queue(maxsize=args.eviction_fifo_size)
     occupancy_tables_fifos = [mp.Manager().Queue(maxsize=1)] * (args.world_size - 1)
     finish_event = mp.Event()
     barrier = mp.Barrier(args.world_size)
