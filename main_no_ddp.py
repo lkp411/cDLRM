@@ -383,122 +383,123 @@ def Run(rank, m_spa, ln_emb, ln_bot, ln_top, train_ld, test_ld, batch_fifo, evic
 
     caching_overhead = []
     cache_group_idxs_window = []
-    for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
-        X = X[rank * local_batch_size: (rank + 1) * local_batch_size, :].to(rank)
-        lS_i = lS_i[:, rank * local_batch_size: (rank + 1) * local_batch_size]
-        lS_o = lS_o[:, :local_batch_size]
-        T = T[rank * local_batch_size: (rank + 1) * local_batch_size, :].to(rank)
+    for epoch in range(args.nepochs):
+        for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
+            X = X[rank * local_batch_size: (rank + 1) * local_batch_size, :].to(rank)
+            lS_i = lS_i[:, rank * local_batch_size: (rank + 1) * local_batch_size]
+            lS_o = lS_o[:, :local_batch_size]
+            T = T[rank * local_batch_size: (rank + 1) * local_batch_size, :].to(rank)
 
-        if j % args.lookahead == 0:
-            # Pull from fifo and setup caches
-            start = timer()
-            dist_req_objs = load_caches_and_broadcast(cache_group, batch_fifo, eviction_fifo, rank)
-            wait_wrap(dist_req_objs)
-            end = timer()
-            caching_overhead.append(end - start)
+            if j % args.lookahead == 0:
+                # Pull from fifo and setup caches
+                start = timer()
+                dist_req_objs = load_caches_and_broadcast(cache_group, batch_fifo, eviction_fifo, rank)
+                wait_wrap(dist_req_objs)
+                end = timer()
+                caching_overhead.append(end - start)
 
-        t1 = time_wrap(rank)
+            t1 = time_wrap(rank)
 
-        # Forward and Backward
-        lookups, cache_group_idxs = cache_group(lS_o, lS_i, emb_tables, rank)
-        Z = dlrm(X, lookups)
-        E = loss_fn_wrap(Z, T, loss_fn, args, loss_ws)
-        optimizer_mlps.zero_grad()
-        optimizer_embeds.zero_grad()
-        E.backward()
+            # Forward and Backward
+            lookups, cache_group_idxs = cache_group(lS_o, lS_i, emb_tables, rank)
+            Z = dlrm(X, lookups)
+            E = loss_fn_wrap(Z, T, loss_fn, args, loss_ws)
+            optimizer_mlps.zero_grad()
+            optimizer_embeds.zero_grad()
+            E.backward()
 
-        # Gradient aggregation for MLPs + param update
-        request_objs_mlps = aggregate_gradients(dlrm)
-        optimizer_embeds.step()
-        wait_wrap(request_objs_mlps)
-        optimizer_mlps.step()
+            # Gradient aggregation for MLPs + param update
+            request_objs_mlps = aggregate_gradients(dlrm)
+            optimizer_embeds.step()
+            wait_wrap(request_objs_mlps)
+            optimizer_mlps.step()
 
-        # Aggregate parameters for cache group
-        if j > 0 and j % args.table_agg_freq == 0:
-            cache_group_idxs = torch.cat(cache_group_idxs_window + [torch.stack(cache_group_idxs)], dim=1)
-            broadcast_and_aggregate(cache_group, cache_group_idxs, rank, args.table_agg_op)
-            cache_group_idxs_window = []
-        else:
-            cache_group_idxs_window.append(torch.stack(cache_group_idxs))
+            # Aggregate parameters for cache group
+            if j > 0 and j % args.table_agg_freq == 0:
+                cache_group_idxs = torch.cat(cache_group_idxs_window + [torch.stack(cache_group_idxs)], dim=1)
+                broadcast_and_aggregate(cache_group, cache_group_idxs, rank, args.table_agg_op)
+                cache_group_idxs_window = []
+            else:
+                cache_group_idxs_window.append(torch.stack(cache_group_idxs))
 
-        t2 = time_wrap(rank)
+            t2 = time_wrap(rank)
 
-        L = E.detach().cpu().numpy()  # numpy array
-        S = Z.detach().cpu().numpy()  # numpy array
-        T = T.detach().cpu().numpy()  # numpy array
-        mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
-        A = np.sum((np.round(S, 0) == T).astype(np.uint8))
+            L = E.detach().cpu().numpy()  # numpy array
+            S = Z.detach().cpu().numpy()  # numpy array
+            T = T.detach().cpu().numpy()  # numpy array
+            mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
+            A = np.sum((np.round(S, 0) == T).astype(np.uint8))
 
-        if rank == 0:
-            total_loss_world = 0
-            total_acc_world = 0
-            # Get losses and accuracies from other processes
-            for process in range(1, dist.get_world_size()):
-                # Get losses
-                L_t = torch.tensor(L, device=rank)
-                L_p = torch.zeros_like(L_t)
-                dist.broadcast(L_p, src=process)
-                L_p = L_p.detach().cpu().numpy()
-                total_loss_world += L_p * mbs
+            if rank == 0:
+                total_loss_world = 0
+                total_acc_world = 0
+                # Get losses and accuracies from other processes
+                for process in range(1, dist.get_world_size()):
+                    # Get losses
+                    L_t = torch.tensor(L, device=rank)
+                    L_p = torch.zeros_like(L_t)
+                    dist.broadcast(L_p, src=process)
+                    L_p = L_p.detach().cpu().numpy()
+                    total_loss_world += L_p * mbs
 
-                # Get accuracies
-                A_t = torch.tensor([A.item()], device=rank)
-                A_p = torch.zeros_like(A_t)
-                dist.broadcast(A_p, src=process)
-                A_p = A_p.detach().cpu().item()
-                total_acc_world += A_p
+                    # Get accuracies
+                    A_t = torch.tensor([A.item()], device=rank)
+                    A_p = torch.zeros_like(A_t)
+                    dist.broadcast(A_p, src=process)
+                    A_p = A_p.detach().cpu().item()
+                    total_acc_world += A_p
 
-            total_time += t2 - t1
-            total_loss += ((L * mbs + total_loss_world) / dist.get_world_size())
-            total_accu += ((A + total_acc_world) / dist.get_world_size())
-            total_iter += 1
-            total_samp += mbs
+                total_time += t2 - t1
+                total_loss += ((L * mbs + total_loss_world) / dist.get_world_size())
+                total_accu += ((A + total_acc_world) / dist.get_world_size())
+                total_iter += 1
+                total_samp += mbs
 
-            if j > 0 and j % args.print_freq == 0:
-                gT = 1000.0 * total_time / total_iter
-                total_time = 0
+                if j > 0 and j % args.print_freq == 0:
+                    gT = 1000.0 * total_time / total_iter
+                    total_time = 0
 
-                gA = total_accu / total_samp
-                total_accu = 0
+                    gA = total_accu / total_samp
+                    total_accu = 0
 
-                gL = total_loss / total_samp
-                total_loss = 0
+                    gL = total_loss / total_samp
+                    total_loss = 0
 
-                avg_caching_overhead = np.mean(caching_overhead) / args.lookahead
-                caching_overhead = []
+                    avg_caching_overhead = np.mean(caching_overhead) / args.lookahead
+                    caching_overhead = []
 
-                print('Finished {}/{} in {} ms/it. Caching overhead = {}. Loss = {}, Train Acc = {}'.format(j, len(train_ld), gT,
-                                                                                                            1000 * avg_caching_overhead,
-                                                                                                            gL, gA))
+                    print('Epoch {}: Finished {}/{} in {} ms/it. Caching overhead = {}. Loss = {}, Train Acc = {}'.format(epoch, j, len(train_ld), gT,
+                                                                                                                1000 * avg_caching_overhead,
+                                                                                                                gL, gA))
 
-                total_samp = 0
-                total_iter = 0
+                    total_samp = 0
+                    total_iter = 0
 
-            # region Testing - Only rank 0 tests
-            if (j > 0 and j % args.test_freq == 0) or j == len(train_ld) - 1:
-                print('Testing at {}/{}....'.format(j, len(train_ld)))
-                test_samp = 0
-                total_test_acc = 0
-                with torch.no_grad():
-                    for i, (X, lS_o, lS_i, T) in enumerate(test_ld):
-                        X = X.to(rank)
-                        lookups, _ = cache_group(lS_o, lS_i, emb_tables, rank)
-                        Z = dlrm(X, lookups)
-                        S = Z.cpu().numpy()
-                        T = T.cpu().numpy()
-                        test_acc = np.sum((np.round(S, 0) == T).astype(np.uint32))
-                        test_samp += T.shape[0]
-                        total_test_acc += test_acc
+                # region Testing - Only rank 0 tests
+                if (j > 0 and j % args.test_freq == 0) or j == len(train_ld) - 1:
+                    print('Testing at {}/{}....'.format(j, len(train_ld)))
+                    test_samp = 0
+                    total_test_acc = 0
+                    with torch.no_grad():
+                        for i, (X, lS_o, lS_i, T) in enumerate(test_ld):
+                            X = X.to(rank)
+                            lookups, _ = cache_group(lS_o, lS_i, emb_tables, rank)
+                            Z = dlrm(X, lookups)
+                            S = Z.cpu().numpy()
+                            T = T.cpu().numpy()
+                            test_acc = np.sum((np.round(S, 0) == T).astype(np.uint32))
+                            test_samp += T.shape[0]
+                            total_test_acc += test_acc
 
-                print('Test accuracy = {}%'.format(100 * (total_test_acc / test_samp)))
-            # endregion
+                    print('Test accuracy = {}%'.format(100 * (total_test_acc / test_samp)))
+                # endregion
 
-        else:
-            for process in range(1, dist.get_world_size()):
-                L_t = torch.tensor(L, device=rank)
-                A_t = torch.tensor([A.item()], device=rank)
-                dist.broadcast(L_t, src=process)
-                dist.broadcast(A_t, src=process)
+            else:
+                for process in range(1, dist.get_world_size()):
+                    L_t = torch.tensor(L, device=rank)
+                    A_t = torch.tensor([A.item()], device=rank)
+                    dist.broadcast(L_t, src=process)
+                    dist.broadcast(A_t, src=process)
 
 
 if __name__ == '__main__':
